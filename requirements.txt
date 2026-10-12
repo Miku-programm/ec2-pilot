@@ -1,0 +1,2 @@
+# Tested runtime dependency snapshot. Update deliberately and rerun the tests.
+-r requirements.lock

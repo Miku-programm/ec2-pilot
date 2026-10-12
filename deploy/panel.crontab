@@ -1,0 +1,6 @@
+# Optional Linux crontab. Replace /opt/ec2-panel with your installation path.
+# Run as the same OS user as the panel. Set PANEL_SCHEDULER=external for web app.
+# PANEL_DATA_DIR and PANEL_ENCRYPTION_KEY must match the web app if overridden.
+# Each monitor's five-field cron expression/timezone is evaluated by cron_worker.
+# flock prevents overlap. File contains no AWS credentials or panel password.
+* * * * * cd /opt/ec2-panel && /usr/bin/flock -n /opt/ec2-panel/data/cron.lock /opt/ec2-panel/.venv/bin/python -m app.cron_worker --once >> /opt/ec2-panel/data/cron.log 2>&1

@@ -1,0 +1,20 @@
+services:
+  panel:
+    build: .
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      PANEL_ADMIN_PASSWORD: ${PANEL_ADMIN_PASSWORD:?Set a password of at least 12 characters in .env}
+      PANEL_SECURE_COOKIE: ${PANEL_SECURE_COOKIE:-0}
+      PANEL_ALLOWED_HOSTS: ${PANEL_ALLOWED_HOSTS:-localhost,127.0.0.1,::1}
+      PANEL_SCHEDULER: ${PANEL_SCHEDULER:-internal}
+    volumes:
+      - panel-data:/data
+    restart: unless-stopped
+    init: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+volumes:
+  panel-data:
