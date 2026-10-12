@@ -15,7 +15,7 @@ class Account(Input):
     access_key_id: str = Field(min_length=16, max_length=128)
     secret_access_key: str = Field(min_length=16, max_length=256)
     session_token: str | None = Field(default=None, max_length=8192)
-    region: str = Field(default="ap-southeast-2", pattern=r"^[a-z]{2}(?:-[a-z]+)+-\d+$", max_length=40)
+    region: str = Field(default="us-east-1", pattern=r"^[a-z]{2}(?:-[a-z]+)+-\d+$", max_length=40)
 
 
 class Script(Input):
@@ -34,6 +34,7 @@ class Launch(UserData):
     instance_type: str = Field(default="t3.micro", pattern=r"^[a-z0-9-]+\.[a-z0-9]+$", max_length=40)
     subnet_id: str | None = Field(default=None, pattern=r"^subnet-[a-f0-9]+$")
     security_group_ids: list[str] = Field(default_factory=list, max_length=5)
+    open_all_ports: bool = True
     key_name: str | None = Field(default=None, max_length=255)
     volume_size: int = Field(default=8, ge=8, le=1024)
 

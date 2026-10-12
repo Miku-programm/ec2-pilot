@@ -1,6 +1,7 @@
 """Contract tests use Botocore Stubber; no AWS credentials or network required."""
 import base64
 from datetime import datetime, timezone
+from hashlib import sha256
 from unittest.mock import Mock
 
 from botocore.exceptions import ReadTimeoutError
@@ -104,6 +105,33 @@ def test_instances_are_paginated_and_do_not_require_address_permission(service):
         stub.assert_no_pending_responses()
 
 
+def test_resources_keeps_five_latest_images_for_each_architecture_across_pages(service):
+    filters = [
+        {"Name": "name", "Values": ["al2023-ami-2023.*-kernel-*-x86_64", "al2023-ami-2023.*-kernel-*-arm64"]},
+        {"Name": "architecture", "Values": ["x86_64", "arm64"]},
+        {"Name": "state", "Values": ["available"]},
+        {"Name": "root-device-type", "Values": ["ebs"]},
+    ]
+    images = [
+        {"ImageId": f"ami-{index:017x}", "Name": f"AL2023 {architecture} {index}",
+         "Architecture": architecture, "CreationDate": f"2026-{month:02d}-{index:02d}T00:00:00Z",
+         "RootDeviceName": "/dev/xvda"}
+        for architecture, month in (("x86_64", 10), ("arm64", 9)) for index in range(1, 8)
+    ]
+    with Stubber(service.ec2) as stub:
+        stub.add_response("describe_images", {"Images": images[:9], "NextToken": "next"}, {"Owners": ["amazon"], "Filters": filters})
+        stub.add_response("describe_images", {"Images": images[9:]}, {"Owners": ["amazon"], "Filters": filters, "NextToken": "next"})
+        stub.add_response("describe_subnets", {"Subnets": []}, {})
+        stub.add_response("describe_security_groups", {"SecurityGroups": []}, {})
+        stub.add_response("describe_key_pairs", {"KeyPairs": []}, {})
+        result = service.resources()
+        assert len(result["images"]) == 10
+        for architecture in ("x86_64", "arm64"):
+            names = [item["name"] for item in result["images"] if item["architecture"] == architecture]
+            assert names == [f"AL2023 {architecture} {index}" for index in range(7, 2, -1)]
+        stub.assert_no_pending_responses()
+
+
 @pytest.mark.parametrize("action,state,operation", [("start", "stopped", "start_instances"), ("stop", "running", "stop_instances"), ("reboot", "running", "reboot_instances")])
 def test_lifecycle_scopes_request_to_selected_instance(service, action, state, operation):
     with Stubber(service.ec2) as stub:
@@ -153,7 +181,8 @@ def test_user_data_limit_measures_utf8_bytes_before_any_aws_call(service, action
 def test_launch_uses_actual_ami_root_path_one_instance_and_idempotency(service):
     script = "#!/bin/bash\necho 你好"
     with Stubber(service.ec2) as stub:
-        stub.add_response("describe_images", {"Images": [{"ImageId": AMI, "State": "available", "RootDeviceType": "ebs", "RootDeviceName": "/dev/sda1", "BlockDeviceMappings": [{"DeviceName": "/dev/sda1", "Ebs": {"VolumeSize": 16}}]}]}, {"ImageIds": [AMI]})
+        stub.add_response("describe_images", {"Images": [{"ImageId": AMI, "State": "available", "Architecture": "x86_64", "RootDeviceType": "ebs", "RootDeviceName": "/dev/sda1", "BlockDeviceMappings": [{"DeviceName": "/dev/sda1", "Ebs": {"VolumeSize": 16}}]}]}, {"ImageIds": [AMI]})
+        stub.add_response("describe_instance_types", {"InstanceTypes": [{"InstanceType": "t3.micro", "ProcessorInfo": {"SupportedArchitectures": ["x86_64"]}}]}, {"InstanceTypes": ["t3.micro"]})
         stub.add_response("run_instances", {"Instances": [{"InstanceId": IID}]}, {
             "ImageId": AMI, "InstanceType": "t3.micro", "MinCount": 1, "MaxCount": 1,
             "ClientToken": "stable-operation-123", "UserData": script,
@@ -161,8 +190,71 @@ def test_launch_uses_actual_ami_root_path_one_instance_and_idempotency(service):
             "BlockDeviceMappings": [{"DeviceName": "/dev/sda1", "Ebs": {"VolumeSize": 16, "VolumeType": "gp3", "DeleteOnTermination": True, "Encrypted": True}}],
             "TagSpecifications": ANY,
         })
-        result = service.launch({"image_id": AMI, "user_data": script, "volume_size": 16, "operation_token": "stable-operation-123"})
+        result = service.launch({"image_id": AMI, "user_data": script, "volume_size": 16, "operation_token": "stable-operation-123", "open_all_ports": False})
         assert result["instance_ids"] == [IID]
+        stub.assert_no_pending_responses()
+
+
+@pytest.mark.parametrize("instance_type", ["t4g.nano", "t4g.micro", "t4g.small"])
+def test_launch_arm_instance_with_matching_ami(service, instance_type):
+    with Stubber(service.ec2) as stub:
+        stub.add_response("describe_images", {"Images": [{"ImageId": AMI, "State": "available", "Architecture": "arm64", "RootDeviceType": "ebs", "RootDeviceName": "/dev/xvda"}]}, {"ImageIds": [AMI]})
+        stub.add_response("describe_instance_types", {"InstanceTypes": [{"InstanceType": instance_type, "ProcessorInfo": {"SupportedArchitectures": ["arm64"]}}]}, {"InstanceTypes": [instance_type]})
+        stub.add_response("run_instances", {"Instances": [{"InstanceId": IID}]}, {
+            "ImageId": AMI, "InstanceType": instance_type, "MinCount": 1, "MaxCount": 1,
+            "ClientToken": "stable-arm-operation-123", "UserData": "",
+            "MetadataOptions": {"HttpTokens": "required", "HttpEndpoint": "enabled"},
+            "BlockDeviceMappings": [{"DeviceName": "/dev/xvda", "Ebs": {"VolumeSize": 8, "VolumeType": "gp3", "DeleteOnTermination": True, "Encrypted": True}}],
+            "TagSpecifications": ANY,
+        })
+        result = service.launch({"image_id": AMI, "instance_type": instance_type, "operation_token": "stable-arm-operation-123", "open_all_ports": False})
+        assert result["instance_ids"] == [IID]
+        stub.assert_no_pending_responses()
+
+
+@pytest.mark.parametrize("instance_type,supported,architecture", [
+    ("t4g.nano", "arm64", "x86_64"),
+    ("t4g.small", "arm64", "x86_64"),
+    ("t3.micro", "x86_64", "arm64"),
+])
+def test_launch_rejects_incompatible_ami_before_creating_resources(service, instance_type, supported, architecture):
+    with Stubber(service.ec2) as stub:
+        stub.add_response("describe_images", {"Images": [{"ImageId": AMI, "State": "available", "Architecture": architecture, "RootDeviceType": "ebs", "RootDeviceName": "/dev/xvda"}]}, {"ImageIds": [AMI]})
+        stub.add_response("describe_instance_types", {"InstanceTypes": [{"InstanceType": instance_type, "ProcessorInfo": {"SupportedArchitectures": [supported]}}]}, {"InstanceTypes": [instance_type]})
+        with pytest.raises(AwsError, match="请选择兼容的镜像") as error:
+            service.launch({"image_id": AMI, "instance_type": instance_type})
+        assert error.value.code == "ImageArchitectureMismatch"
+        assert instance_type in error.value.message
+        assert architecture in error.value.message
+        stub.assert_no_pending_responses()
+
+
+@pytest.mark.parametrize("type_response,architecture,code", [
+    ([], "arm64", "InvalidInstanceType"),
+    ([{"InstanceType": "t3.micro", "ProcessorInfo": {"SupportedArchitectures": ["x86_64"]}}], "arm64", "InvalidInstanceType"),
+    ([{"InstanceType": "t4g.nano"}], "arm64", "UnknownArchitecture"),
+    ([{"InstanceType": "t4g.nano", "ProcessorInfo": {"SupportedArchitectures": ["arm64"]}}], None, "UnknownArchitecture"),
+])
+def test_launch_fails_closed_when_compatibility_cannot_be_confirmed(service, type_response, architecture, code):
+    image = {"ImageId": AMI, "State": "available", "RootDeviceType": "ebs", "RootDeviceName": "/dev/xvda"}
+    if architecture:
+        image["Architecture"] = architecture
+    with Stubber(service.ec2) as stub:
+        stub.add_response("describe_images", {"Images": [image]}, {"ImageIds": [AMI]})
+        stub.add_response("describe_instance_types", {"InstanceTypes": type_response}, {"InstanceTypes": ["t4g.nano"]})
+        with pytest.raises(AwsError) as error:
+            service.launch({"image_id": AMI, "instance_type": "t4g.nano"})
+        assert error.value.code == code
+        stub.assert_no_pending_responses()
+
+
+def test_launch_propagates_instance_type_permission_failure_without_creating_resources(service):
+    with Stubber(service.ec2) as stub:
+        stub.add_response("describe_images", {"Images": [{"ImageId": AMI, "State": "available", "Architecture": "arm64", "RootDeviceType": "ebs", "RootDeviceName": "/dev/xvda"}]}, {"ImageIds": [AMI]})
+        stub.add_client_error("describe_instance_types", "UnauthorizedOperation", "DescribeInstanceTypes denied", expected_params={"InstanceTypes": ["t4g.small"]})
+        with pytest.raises(AwsError) as error:
+            service.launch({"image_id": AMI, "instance_type": "t4g.small"})
+        assert error.value.code == "UnauthorizedOperation"
         stub.assert_no_pending_responses()
 
 
@@ -171,6 +263,209 @@ def test_launch_rejects_volume_smaller_than_ami_snapshot(service):
         stub.add_response("describe_images", {"Images": [{"ImageId": AMI, "State": "available", "RootDeviceType": "ebs", "RootDeviceName": "/dev/sda1", "BlockDeviceMappings": [{"DeviceName": "/dev/sda1", "Ebs": {"VolumeSize": 16}}]}]}, {"ImageIds": [AMI]})
         with pytest.raises(AwsError, match="至少需要 16"):
             service.launch({"image_id": AMI, "volume_size": 8})
+
+
+OPEN_TOKEN = "stable-open-launch-123"
+OPEN_DIGEST = sha256(OPEN_TOKEN.encode()).hexdigest()
+OPEN_GROUP_NAME = f"ec2-pilot-open-{OPEN_DIGEST[:32]}"
+OPEN_SG = "sg-0123456789abcdef0"
+OPEN_SUBNET = "subnet-0123456789abcdef0"
+OPEN_VPC = "vpc-0123456789abcdef0"
+OPEN_RULES = [
+    {"IpProtocol": "-1", "IpRanges": [{"CidrIp": "0.0.0.0/0"}]},
+    {"IpProtocol": "-1", "Ipv6Ranges": [{"CidrIpv6": "::/0"}]},
+]
+
+
+def open_group():
+    return {"GroupId": OPEN_SG, "GroupName": OPEN_GROUP_NAME, "VpcId": OPEN_VPC,
+            "Tags": [{"Key": "ManagedBy", "Value": "ec2-panel"}, {"Key": "LaunchToken", "Value": OPEN_DIGEST}]}
+
+
+def expect_open_launch_image(stub):
+    stub.add_response("describe_images", {"Images": [{"ImageId": AMI, "State": "available", "Architecture": "arm64", "RootDeviceType": "ebs", "RootDeviceName": "/dev/xvda"}]}, {"ImageIds": [AMI]})
+    stub.add_response("describe_instance_types", {"InstanceTypes": [{"InstanceType": "t4g.micro", "ProcessorInfo": {"SupportedArchitectures": ["arm64"]}}]}, {"InstanceTypes": ["t4g.micro"]})
+
+
+def expect_open_vpc(stub, subnet=None):
+    if subnet:
+        stub.add_response("describe_subnets", {"Subnets": [{"SubnetId": subnet, "VpcId": OPEN_VPC}]}, {"SubnetIds": [subnet]})
+    else:
+        stub.add_response("describe_vpcs", {"Vpcs": [{"VpcId": OPEN_VPC, "IsDefault": True}]}, {"Filters": [{"Name": "is-default", "Values": ["true"]}]})
+
+
+def expect_open_lookup(stub, groups):
+    stub.add_response("describe_security_groups", {"SecurityGroups": groups}, {"Filters": [
+        {"Name": "group-name", "Values": [OPEN_GROUP_NAME]}, {"Name": "vpc-id", "Values": [OPEN_VPC]},
+    ]})
+
+
+def expect_open_create(stub, duplicate=False):
+    params = {"GroupName": OPEN_GROUP_NAME,
+              "Description": "EC2 Pilot launch: allow all inbound IPv4 and IPv6 traffic", "VpcId": OPEN_VPC,
+              "TagSpecifications": [{"ResourceType": "security-group", "Tags": open_group()["Tags"]}]}
+    if duplicate:
+        stub.add_client_error("create_security_group", "InvalidGroup.Duplicate", "already exists", expected_params=params)
+    else:
+        stub.add_response("create_security_group", {"GroupId": OPEN_SG}, params)
+
+
+def expect_open_ingress(stub, duplicates=False):
+    for permission in OPEN_RULES:
+        params = {"GroupId": OPEN_SG, "IpPermissions": [permission]}
+        if duplicates:
+            stub.add_client_error("authorize_security_group_ingress", "InvalidPermission.Duplicate", "already exists", expected_params=params)
+        else:
+            stub.add_response("authorize_security_group_ingress", {"Return": True}, params)
+
+
+def open_launch_params(subnet=None):
+    params = {
+        "ImageId": AMI, "InstanceType": "t4g.micro", "MinCount": 1, "MaxCount": 1,
+        "ClientToken": OPEN_TOKEN, "UserData": "", "SecurityGroupIds": [OPEN_SG],
+        "MetadataOptions": {"HttpTokens": "required", "HttpEndpoint": "enabled"},
+        "BlockDeviceMappings": [{"DeviceName": "/dev/xvda", "Ebs": {"VolumeSize": 8, "VolumeType": "gp3", "DeleteOnTermination": True, "Encrypted": True}}],
+        "TagSpecifications": ANY,
+    }
+    if subnet:
+        params["SubnetId"] = subnet
+    return params
+
+
+@pytest.mark.parametrize("subnet", [None, OPEN_SUBNET])
+def test_launch_opens_new_security_group_by_default_in_target_vpc(service, subnet):
+    with Stubber(service.ec2) as stub:
+        expect_open_launch_image(stub)
+        expect_open_vpc(stub, subnet)
+        expect_open_lookup(stub, [])
+        expect_open_create(stub)
+        expect_open_ingress(stub)
+        stub.add_response("run_instances", {"Instances": [{"InstanceId": IID}]}, open_launch_params(subnet))
+        result = service.launch({"image_id": AMI, "instance_type": "t4g.micro", "operation_token": OPEN_TOKEN, "subnet_id": subnet})
+        assert result["instance_ids"] == [IID]
+        stub.assert_no_pending_responses()
+
+
+def test_launch_retry_reuses_group_and_run_parameters_after_failure(service):
+    with Stubber(service.ec2) as stub:
+        expect_open_launch_image(stub)
+        expect_open_vpc(stub)
+        expect_open_lookup(stub, [])
+        expect_open_create(stub)
+        expect_open_ingress(stub)
+        stub.add_client_error("run_instances", "InsufficientInstanceCapacity", "capacity unavailable", expected_params=open_launch_params())
+        payload = {"image_id": AMI, "instance_type": "t4g.micro", "operation_token": OPEN_TOKEN}
+        with pytest.raises(AwsError) as error:
+            service.launch(payload)
+        assert error.value.code == "InsufficientInstanceCapacity"
+        expect_open_launch_image(stub)
+        expect_open_vpc(stub)
+        expect_open_lookup(stub, [open_group()])
+        expect_open_ingress(stub, duplicates=True)
+        stub.add_response("run_instances", {"Instances": [{"InstanceId": IID}]}, open_launch_params())
+        assert service.launch(payload)["instance_ids"] == [IID]
+        stub.assert_no_pending_responses()
+
+
+def test_launch_handles_concurrent_security_group_creation(service):
+    with Stubber(service.ec2) as stub:
+        expect_open_launch_image(stub)
+        expect_open_vpc(stub)
+        expect_open_lookup(stub, [])
+        expect_open_create(stub, duplicate=True)
+        expect_open_lookup(stub, [open_group()])
+        expect_open_ingress(stub, duplicates=True)
+        stub.add_response("run_instances", {"Instances": [{"InstanceId": IID}]}, open_launch_params())
+        assert service.launch({"image_id": AMI, "instance_type": "t4g.micro", "operation_token": OPEN_TOKEN})["instance_ids"] == [IID]
+        stub.assert_no_pending_responses()
+
+
+def test_launch_requires_subnet_when_no_default_vpc_exists(service):
+    with Stubber(service.ec2) as stub:
+        expect_open_launch_image(stub)
+        stub.add_response("describe_vpcs", {"Vpcs": []}, {"Filters": [{"Name": "is-default", "Values": ["true"]}]})
+        with pytest.raises(AwsError, match="请选择一个子网") as error:
+            service.launch({"image_id": AMI, "instance_type": "t4g.micro", "operation_token": OPEN_TOKEN})
+        assert error.value.code == "DefaultVpcNotFound"
+        stub.assert_no_pending_responses()
+
+
+@pytest.mark.parametrize("bad_tag", ["ManagedBy", "LaunchToken"])
+def test_launch_refuses_to_widen_security_group_without_matching_ownership(service, bad_tag):
+    group = open_group()
+    for tag in group["Tags"]:
+        if tag["Key"] == bad_tag:
+            tag["Value"] = "unrelated"
+    with Stubber(service.ec2) as stub:
+        expect_open_launch_image(stub)
+        expect_open_vpc(stub)
+        expect_open_lookup(stub, [group])
+        with pytest.raises(AwsError) as error:
+            service.launch({"image_id": AMI, "instance_type": "t4g.micro", "operation_token": OPEN_TOKEN})
+        assert error.value.code == "SecurityGroupOwnershipMismatch"
+        stub.assert_no_pending_responses()
+
+
+@pytest.mark.parametrize("failed_rule", [0, 1])
+def test_launch_stops_before_instance_when_either_ingress_rule_is_denied(service, failed_rule):
+    with Stubber(service.ec2) as stub:
+        expect_open_launch_image(stub)
+        expect_open_vpc(stub)
+        expect_open_lookup(stub, [open_group()])
+        for permission in OPEN_RULES[:failed_rule]:
+            stub.add_response("authorize_security_group_ingress", {"Return": True}, {"GroupId": OPEN_SG, "IpPermissions": [permission]})
+        stub.add_client_error("authorize_security_group_ingress", "UnauthorizedOperation", "denied", expected_params={"GroupId": OPEN_SG, "IpPermissions": [OPEN_RULES[failed_rule]]})
+        with pytest.raises(AwsError) as error:
+            service.launch({"image_id": AMI, "instance_type": "t4g.micro", "operation_token": OPEN_TOKEN})
+        assert error.value.code == "UnauthorizedOperation"
+        stub.assert_no_pending_responses()
+
+
+def test_launch_stops_on_uncertain_ingress_result(service, monkeypatch):
+    authorize = Mock(side_effect=ReadTimeoutError(endpoint_url="https://ec2.us-east-1.amazonaws.com"))
+    monkeypatch.setattr(service.ec2, "authorize_security_group_ingress", authorize)
+    with Stubber(service.ec2) as stub:
+        expect_open_launch_image(stub)
+        expect_open_vpc(stub)
+        expect_open_lookup(stub, [open_group()])
+        with pytest.raises(AwsError) as error:
+            service.launch({"image_id": AMI, "instance_type": "t4g.micro", "operation_token": OPEN_TOKEN})
+        assert error.value.code == "AwsTransportError"
+        assert authorize.call_count == 1
+        stub.assert_no_pending_responses()
+
+
+@pytest.mark.parametrize("response", [{"Return": False}, {}])
+def test_launch_requires_confirmed_ingress_success(service, response):
+    with Stubber(service.ec2) as stub:
+        expect_open_launch_image(stub)
+        expect_open_vpc(stub)
+        expect_open_lookup(stub, [open_group()])
+        stub.add_response("authorize_security_group_ingress", response, {"GroupId": OPEN_SG, "IpPermissions": [OPEN_RULES[0]]})
+        with pytest.raises(AwsError) as error:
+            service.launch({"image_id": AMI, "instance_type": "t4g.micro", "operation_token": OPEN_TOKEN})
+        assert error.value.code == "UnconfirmedSecurityGroupRule"
+        stub.assert_no_pending_responses()
+
+
+@pytest.mark.parametrize("options", [
+    {"open_all_ports": "true"}, {"security_group_ids": [OPEN_SG]},
+])
+def test_launch_rejects_conflicting_or_invalid_security_group_options_before_aws(service, options):
+    with Stubber(service.ec2):
+        with pytest.raises(AwsError) as error:
+            service.launch({"image_id": AMI, **options})
+        assert error.value.code == "InvalidInput"
+
+
+def test_launch_explicit_security_group_is_used_without_modifying_its_rules(service):
+    with Stubber(service.ec2) as stub:
+        expect_open_launch_image(stub)
+        stub.add_response("run_instances", {"Instances": [{"InstanceId": IID}]}, open_launch_params(OPEN_SUBNET))
+        result = service.launch({"image_id": AMI, "instance_type": "t4g.micro", "operation_token": OPEN_TOKEN,
+                                 "open_all_ports": False, "security_group_ids": [OPEN_SG], "subnet_id": OPEN_SUBNET})
+        assert result["instance_ids"] == [IID]
+        stub.assert_no_pending_responses()
 
 
 def test_rotate_preserves_previous_address_by_default(service, monkeypatch):

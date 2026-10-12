@@ -7,6 +7,7 @@ The browser's operation token makes an explicitly retried launch idempotent.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from hashlib import sha256
 import re
 from typing import Any
 from uuid import uuid4
@@ -51,7 +52,7 @@ def _iso(value: Any) -> str | None:
 class AwsService:
     def __init__(self, credentials: dict, region: str):
         if not isinstance(region, str) or not re.fullmatch(r"[a-z]{2}(?:-[a-z0-9]+)+-\d", region):
-            raise AwsError("InvalidInput", "AWS 区域格式无效，例如 ap-southeast-2。")
+            raise AwsError("InvalidInput", "AWS 区域格式无效，例如 us-east-1。")
         key = credentials.get("access_key_id", "")
         secret = credentials.get("secret_access_key", "")
         token = credentials.get("session_token") or None
@@ -129,21 +130,88 @@ class AwsService:
 
     def resources(self) -> dict:
         images = self._all("describe_images", "Images", Owners=["amazon"], Filters=[
-            {"Name": "name", "Values": ["al2023-ami-2023.*-kernel-*-x86_64"]},
-            {"Name": "architecture", "Values": ["x86_64"]},
+            {"Name": "name", "Values": ["al2023-ami-2023.*-kernel-*-x86_64", "al2023-ami-2023.*-kernel-*-arm64"]},
+            {"Name": "architecture", "Values": ["x86_64", "arm64"]},
             {"Name": "state", "Values": ["available"]},
             {"Name": "root-device-type", "Values": ["ebs"]},
         ])
         subnets = self._all("describe_subnets", "Subnets")
         groups = self._all("describe_security_groups", "SecurityGroups")
         keys = self._call(self.ec2.describe_key_pairs).get("KeyPairs", [])
-        latest = sorted(images, key=lambda item: item.get("CreationDate", ""), reverse=True)[:5]
+        # Keep each architecture's newest images; a newer x86 release must not
+        # push every ARM image out of the suggestions.
+        latest = []
+        for architecture in ("x86_64", "arm64"):
+            matching = [item for item in images if item.get("Architecture") == architecture]
+            latest.extend(sorted(matching, key=lambda item: item.get("CreationDate", ""), reverse=True)[:5])
         return {
             "images": [{"id": i["ImageId"], "name": i.get("Name", i["ImageId"]), "description": i.get("Description", ""), "architecture": i.get("Architecture"), "root_device_name": i.get("RootDeviceName")} for i in latest],
             "subnets": [{"id": s["SubnetId"], "name": _name(s, s["SubnetId"]), "vpc_id": s.get("VpcId"), "availability_zone": s.get("AvailabilityZone"), "map_public_ip_on_launch": s.get("MapPublicIpOnLaunch", False)} for s in subnets],
             "security_groups": [{"id": g["GroupId"], "name": g.get("GroupName", ""), "vpc_id": g.get("VpcId"), "description": g.get("Description", "")} for g in groups],
             "key_pairs": [{"id": k.get("KeyPairId"), "name": k["KeyName"]} for k in keys],
         }
+
+    def _open_security_group(self, subnet: str | None, token: str) -> str:
+        """Create/reuse only this launch's group; never widen a supplied group."""
+        if subnet:
+            subnets = self._call(self.ec2.describe_subnets, SubnetIds=[subnet]).get("Subnets", [])
+            if len(subnets) != 1 or subnets[0].get("SubnetId") != subnet:
+                raise AwsError("InvalidSubnet", "无法确认所选子网及其 VPC，未创建安全组。")
+            vpc_id = _id(subnets[0].get("VpcId"), "vpc")
+        else:
+            vpcs = self._all("describe_vpcs", "Vpcs", Filters=[{"Name": "is-default", "Values": ["true"]}])
+            if len(vpcs) != 1 or not vpcs[0].get("IsDefault"):
+                raise AwsError("DefaultVpcNotFound", "所选区域没有唯一的默认 VPC，请选择一个子网后重试。")
+            vpc_id = _id(vpcs[0].get("VpcId"), "vpc")
+        digest = sha256(token.encode("utf-8")).hexdigest()
+        group_name = f"ec2-pilot-open-{digest[:32]}"
+
+        def lookup() -> str | None:
+            matches = self._all("describe_security_groups", "SecurityGroups", Filters=[
+                {"Name": "group-name", "Values": [group_name]},
+                {"Name": "vpc-id", "Values": [vpc_id]},
+            ])
+            if not matches:
+                return None
+            if len(matches) != 1:
+                raise AwsError("AmbiguousSecurityGroup", "无法确认本次创建操作的唯一安全组，未修改入站规则。")
+            group = matches[0]
+            tags = {tag.get("Key"): tag.get("Value") for tag in group.get("Tags", [])}
+            if (group.get("GroupName") != group_name or group.get("VpcId") != vpc_id
+                    or tags.get("ManagedBy") != "ec2-panel" or tags.get("LaunchToken") != digest):
+                raise AwsError("SecurityGroupOwnershipMismatch", "同名安全组不属于本次创建操作，未修改其规则。")
+            return _id(group.get("GroupId"), "sg")
+
+        group_id = lookup()
+        if not group_id:
+            try:
+                created = self._call(self.ec2.create_security_group, GroupName=group_name,
+                    Description="EC2 Pilot launch: allow all inbound IPv4 and IPv6 traffic", VpcId=vpc_id,
+                    TagSpecifications=[{"ResourceType": "security-group", "Tags": [
+                        {"Key": "ManagedBy", "Value": "ec2-panel"}, {"Key": "LaunchToken", "Value": digest},
+                    ]}])
+                group_id = _id(created.get("GroupId"), "sg")
+            except AwsError as exc:
+                if exc.code != "InvalidGroup.Duplicate":
+                    raise
+                # A concurrent retry may have created the deterministic name.
+                group_id = lookup()
+                if not group_id:
+                    raise AwsError("SecurityGroupNotFound", "安全组刚被创建但尚无法确认，请用同一创建操作重试。") from None
+        for permission in (
+            {"IpProtocol": "-1", "IpRanges": [{"CidrIp": "0.0.0.0/0"}]},
+            {"IpProtocol": "-1", "Ipv6Ranges": [{"CidrIpv6": "::/0"}]},
+        ):
+            try:
+                authorized = self._call(self.ec2.authorize_security_group_ingress, GroupId=group_id, IpPermissions=[permission])
+                if authorized.get("Return") is not True:
+                    raise AwsError("UnconfirmedSecurityGroupRule", "AWS 未确认安全组入站规则已生效，尚未创建实例。请用同一创建操作重试。")
+            except AwsError as exc:
+                if exc.code != "InvalidPermission.Duplicate":
+                    raise
+        # Keep the group if RunInstances later fails: the same launch token must
+        # always reuse the same SecurityGroupIds for AWS client-token idempotency.
+        return group_id
 
     def launch(self, payload: dict) -> dict:
         image_id = _id(payload.get("image_id"), "ami")
@@ -165,6 +233,11 @@ class AwsService:
         if not isinstance(groups, list) or len(groups) > 16:
             raise AwsError("InvalidInput", "安全组必须是 ID 列表。")
         groups = [_id(group, "sg") for group in groups]
+        open_all_ports = payload.get("open_all_ports", True)
+        if not isinstance(open_all_ports, bool):
+            raise AwsError("InvalidInput", "open_all_ports 必须是布尔值。")
+        if open_all_ports and groups:
+            raise AwsError("InvalidInput", "自动全部开放与手动指定安全组不能同时使用，请关闭自动全部开放或清空安全组。")
         subnet = payload.get("subnet_id")
         if subnet:
             subnet = _id(subnet, "subnet")
@@ -178,6 +251,17 @@ class AwsService:
         minimum = next((m.get("Ebs", {}).get("VolumeSize", 0) for m in image.get("BlockDeviceMappings", []) if m.get("DeviceName") == root_device), 0)
         if volume_size < minimum:
             raise AwsError("InvalidInput", f"该 AMI 的根磁盘至少需要 {minimum} GiB。")
+        instance_types = self._call(self.ec2.describe_instance_types, InstanceTypes=[instance_type]).get("InstanceTypes", [])
+        if len(instance_types) != 1 or instance_types[0].get("InstanceType") != instance_type:
+            raise AwsError("InvalidInstanceType", f"在所选区域无法确认实例规格 {instance_type}。")
+        supported = instance_types[0].get("ProcessorInfo", {}).get("SupportedArchitectures", [])
+        architecture = image.get("Architecture")
+        if not architecture or not supported:
+            raise AwsError("UnknownArchitecture", "无法确认 AMI 或实例规格的处理器架构，请选择其他镜像或规格。")
+        if architecture not in supported:
+            raise AwsError("ImageArchitectureMismatch", f"实例规格 {instance_type} 支持 {', '.join(supported)}，所选 AMI 为 {architecture}；请选择兼容的镜像。")
+        if open_all_ports:
+            groups = [self._open_security_group(subnet, token)]
         request = {
             "ImageId": image_id, "InstanceType": instance_type,
             "MinCount": 1, "MaxCount": 1, "ClientToken": token,

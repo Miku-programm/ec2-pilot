@@ -87,6 +87,21 @@ def test_secrets_encrypted_and_not_returned(client):
     assert record["credentials"]["secret_access_key"] == "secret-testing-" * 4
 
 
+def test_default_region_and_saved_account_region(client):
+    auth(client)
+    existing = add_account(client)
+    response = client.post("/api/accounts", json={
+        "name": "USA default", "access_key_id": "AKIA" + "Y" * 16,
+        "secret_access_key": "secret-testing-" * 4,
+    })
+    assert response.status_code == 200, response.text
+    saved = client.app.state.store.get("accounts", response.json()["id"])
+    assert saved["region"] == "us-east-1"
+    state = client.get("/api/state").json()
+    assert state["meta"]["default_region"] == "us-east-1"
+    assert next(a for a in state["accounts"] if a["id"] == existing)["region"] == "ap-southeast-2"
+
+
 def test_validation_does_not_echo_credentials(client):
     auth(client)
     r = client.post("/api/accounts", json={"name": "n", "access_key_id": "tiny-secret", "secret_access_key": "private-short"})
@@ -104,6 +119,14 @@ def test_launch_idempotency_and_specific_rotate_route(client):
     r = client.post(f"/api/accounts/{a}/instances/launch", json=launch, headers={"Idempotency-Key": token})
     assert r.status_code == 200, r.text
     assert FakeAws.calls[-1][1]["operation_token"] == token
+    assert FakeAws.calls[-1][1]["open_all_ports"] is True
+    assert FakeAws.calls[-1][1]["security_group_ids"] == []
+    custom_launch = {**launch, "open_all_ports": False, "security_group_ids": ["sg-0123456789abcdef0"]}
+    r = client.post(f"/api/accounts/{a}/instances/launch", json=custom_launch,
+                    headers={"Idempotency-Key": "23456789-1234-1234-1234-123456789012"})
+    assert r.status_code == 200, r.text
+    assert FakeAws.calls[-1][1]["open_all_ports"] is False
+    assert FakeAws.calls[-1][1]["security_group_ids"] == custom_launch["security_group_ids"]
     r = client.post(f"/api/accounts/{a}/instances/{INSTANCE}/rotate-ip", json={"release_previous": False})
     assert r.status_code == 200, r.text
     assert FakeAws.calls[-1] == ("rotate", INSTANCE, False)

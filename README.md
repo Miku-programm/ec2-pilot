@@ -4,8 +4,10 @@
 
 ## 已实现
 
-- 多账号添加：通过 STS 验证 AK/SK，可选 Session Token，区域默认悉尼 `ap-southeast-2`。
+- 多账号添加：通过 STS 验证 AK/SK，可选 Session Token，新账号区域默认美国东部（弗吉尼亚北部）`us-east-1`，已有账号保留原区域。
 - EC2 实例列表、创建、开机、停机、重启、操作记录；创建请求带幂等标识。
+- ARM 实例：提供 `t4g.micro`、`t4g.small` 选项；按架构筛选 Amazon Linux 2023 镜像，并在创建前校验 AMI 与实例类型的架构是否匹配。
+- 新建实例默认新建专用安全组，放行 IPv4 / IPv6 任意来源的所有入站协议和端口；可取消“全部开放”并选择已有安全组。
 - 脚本模板和 User Data：新实例启动时提交脚本；已停止实例可以修改 User Data。
 - 更换 IP：为主网卡分配并绑定新 Elastic IP，可选释放之前的 EIP。
 - TCPing：真实 TCP 连接采样，展示成功次数、平均延迟、连接失败率和历史。
@@ -54,11 +56,17 @@ docker compose down
 ## 推荐使用顺序
 
 1. 添加 AWS 账号，只验证 STS 身份，不查询联系人，也不会升级套餐。
-2. 在 EC2 页点击刷新。管理已有实例时选中相应操作；开新机器时选择已有 AMI、子网、安全组及密钥对。
+2. 在 EC2 页点击刷新。管理已有实例时选中相应操作；开新机器时选择 AMI、子网及密钥对，安全组默认全部开放，也可取消勾选后填写已有安全组。
 3. 在脚本库保存你的脚本；新建 EC2 时选择模板。默认 Nginx 示例适合 Amazon Linux 2023。
 4. 创建监控：选择账号和实例、TCP 端口、Cron 表达式、时区与超时；点击立即检测验证。需要定时换 IP 时勾选“自动更换 IP”，设置触发条件和连续失败阈值后保存。
 
-启动新实例使用现有子网的公网 IP 分配设置。本面板不自动开放安全组端口、不创建 VPC/子网/SSH 密钥对。需要公网直连时，子网路由、安全组和服务器上的监听服务必须正确配置。创建规格、EBS、公网 IPv4 和流量可能消耗赠金；请以 AWS 实际计费规则为准。
+创建 T4g 实例时使用 `arm64` 镜像，T2 / T3 使用 `x86_64` 镜像。镜像建议分别保留两种架构最新的最多 5 个 Amazon Linux 2023 AMI；切换机型后会清空已知不兼容的 AMI，手填的其他 AMI 会由后端查询 AWS 后校验。初始化脚本中下载的程序也须适配所选架构。机型名称与架构参见 [AWS T4g 官方说明](https://aws.amazon.com/ec2/instance-types/t4/)。
+
+若使用本项目早期 IAM 示例，创建实例现在还需 `ec2:DescribeInstanceTypes` 读取权限；自动创建安全组还需 `ec2:DescribeVpcs`、`ec2:CreateSecurityGroup`、`ec2:AuthorizeSecurityGroupIngress`，以及创建安全组时的 `ec2:CreateTags` 权限。更新后的 IAM 示例默认限制在 `us-east-1`；管理其他区域时请按实际区域调整 `aws:RequestedRegion`。更改默认区域不会迁移已有资源，Cron 时区仍独立配置。
+
+启动新实例使用现有子网的公网 IP 分配设置。默认“全部开放”会在所选子网的 VPC（未填子网时为默认 VPC）内新建专用安全组，允许 `0.0.0.0/0` 与 `::/0` 访问所有入站协议和端口，保留 AWS 默认出站规则；这意味着任意公网来源均可尝试连接实例。取消勾选后使用指定安全组，未指定时使用 AWS 默认安全组。已有安全组不会被修改。
+
+同一创建请求重试会复用专用安全组；实例创建失败后该组保留，便于用相同幂等标识重试，确认不再使用后可从 AWS 删除。面板不创建 VPC/子网/SSH 密钥对；没有默认 VPC 时需选择已有子网。公网直连仍需正确的子网路由、公网 IP 与服务器监听服务。创建规格、EBS、公网 IPv4 和流量可能消耗赠金；请以 AWS 实际计费规则为准。
 
 新实例根磁盘使用加密 gp3。默认按 AWS 账户的 EBS 加密密钥设置创建；如果账户默认使用自定义 KMS 密钥，或镜像快照由自定义密钥加密，还需相应密钥授权。附带 IAM 示例没有授予 KMS 权限，请为实际密钥单独配置，避免使用无限制的 `kms:*`。
 
@@ -163,6 +171,6 @@ API 不返回原始 AK/SK，浏览器不将它们保存到 localStorage。操作
 
 自动化测试用 Stubber / 假 AWS 客户端验证参数、状态、失败清理、加密、认证、动态 IP、后台调度和探针行为，不创建真实 EC2、不分配真实 EIP。真实 AWS 操作需你在面板中添加自己的密钥后验证。
 
-本次交付验证（2026-10-13）：211 项 Python 测试全部通过（包含 Cron、自动换 IP、取消冷却和次数上限、旧配置迁移、重复任务、重启恢复及租约测试）。Chromium 浏览器检查通过桌面 / 390px 手机布局、导航与弹窗、首次设置与登录退出、脚本增删改和只读演示隔离；新增 Cron / 自动换 IP 表单、开关、规则提交、暂停解除及手机布局也通过隔离浏览器检查；无 JavaScript 页面错误。Linux cron 单次工作器已在空数据目录执行通过。JavaScript 语法、启动 shell 脚本和 IAM JSON 校验通过。测试环境为 Python 3.14；存在一条 Starlette 测试客户端的弃用提示，不影响测试结果。当前环境没有 Docker，Dockerfile / Compose 已提供但未实际构建容器；Windows 启动批处理和真实 AWS 操作尚未实机验证。
+本次交付验证（2026-10-13）：239 项 Python 测试全部通过（包含 Cron、自动换 IP、取消冷却和次数上限、旧配置迁移、重复任务、重启恢复、租约、ARM 镜像匹配、美国区域默认值、安全组创建和重试测试）。Chromium 浏览器检查通过桌面 / 390px 手机布局、导航与弹窗、首次设置与登录退出、脚本增删改和只读演示隔离；新增 Cron / 自动换 IP 表单、开关、规则提交、暂停解除及手机布局也通过隔离浏览器检查；ARM 镜像筛选、默认美国区域、安全组默认开放 / 自定义组提交、资源请求竞态与移动端布局通过隔离浏览器检查；无 JavaScript 页面错误。Linux cron 单次工作器已在空数据目录执行通过。JavaScript 语法、启动 shell 脚本和 IAM JSON 校验通过。测试环境为 Python 3.14；存在一条 Starlette 测试客户端的弃用提示，不影响测试结果。当前环境没有 Docker，Dockerfile / Compose 已提供但未实际构建容器；Windows 启动批处理和真实 AWS 操作尚未实机验证。
 
 参考：[aws.sb 公开 API](https://api.aws.sb/)、[AWS 项目 SCP](https://docs.aws.amazon.com/accounts/latest/reference/scps-and-rcps-for-projects.html)、[EC2 User Data](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/user-data.html)、[Elastic IP](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/elastic-ip-addresses-eip.html)。本项目为独立实现，与 aws.sb 无隶属关系。

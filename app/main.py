@@ -27,7 +27,7 @@ from .scheduling import next_run
 from .rotation_policy import qualifying_failure
 from .leases import keep_lease
 
-VERSION = "1.1.1"
+VERSION = "1.1.2"
 BASE = Path(__file__).resolve().parent.parent
 COOKIE = "ec2_panel_session"
 
@@ -229,7 +229,7 @@ def create_app(data_dir=None, *, start_scheduler=True, aws_factory=AwsService, s
                 guard = store().rotation_guard(resource_key(monitor["account_id"], monitor["instance_id"]))
                 if guard.get("state") in {"in_progress", "awaiting_review"}:
                     monitor.update(rotation_status="awaiting_review", rotation_message="换 IP 尚未确认或失败；请核对 AWS 后解除自动更换暂停")
-        return {**payload, "meta": {"default_region": "ap-southeast-2", "server_time": now(), "version": VERSION, "scheduler_mode": os.getenv("PANEL_SCHEDULER", "internal")}}
+        return {**payload, "meta": {"default_region": "us-east-1", "server_time": now(), "version": VERSION, "scheduler_mode": os.getenv("PANEL_SCHEDULER", "internal")}}
 
     @app.post("/api/accounts", dependencies=auth)
     def add_account(body: Account):
