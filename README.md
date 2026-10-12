@@ -6,7 +6,7 @@
 
 - 多账号添加：通过 STS 验证 AK/SK，可选 Session Token，新账号区域默认美国东部（弗吉尼亚北部）`us-east-1`，已有账号保留原区域。
 - EC2 实例列表、创建、开机、停机、重启、操作记录；创建请求带幂等标识。
-- ARM 实例：提供 `t4g.micro`、`t4g.small` 选项；按架构筛选 Amazon Linux 2023 镜像，并在创建前校验 AMI 与实例类型的架构是否匹配。
+- ARM 实例：机型下拉菜单按 ARM64 / x86_64 分组，直接提供 `t4g.micro`、`t4g.small`，其他机型可选择“其他机型（手动输入）”；按架构筛选 Amazon Linux 2023 镜像，并在创建前校验 AMI 与实例类型的架构是否匹配。
 - 新建实例默认新建专用安全组，放行 IPv4 / IPv6 任意来源的所有入站协议和端口；可取消“全部开放”并选择已有安全组。
 - 脚本模板和 User Data：新实例启动时提交脚本；已停止实例可以修改 User Data。
 - 更换 IP：为主网卡分配并绑定新 Elastic IP，可选释放之前的 EIP。
@@ -60,7 +60,7 @@ docker compose down
 3. 在脚本库保存你的脚本；新建 EC2 时选择模板。默认 Nginx 示例适合 Amazon Linux 2023。
 4. 创建监控：选择账号和实例、TCP 端口、Cron 表达式、时区与超时；点击立即检测验证。需要定时换 IP 时勾选“自动更换 IP”，设置触发条件和连续失败阈值后保存。
 
-创建 T4g 实例时使用 `arm64` 镜像，T2 / T3 使用 `x86_64` 镜像。镜像建议分别保留两种架构最新的最多 5 个 Amazon Linux 2023 AMI；切换机型后会清空已知不兼容的 AMI，手填的其他 AMI 会由后端查询 AWS 后校验。初始化脚本中下载的程序也须适配所选架构。机型名称与架构参见 [AWS T4g 官方说明](https://aws.amazon.com/ec2/instance-types/t4/)。
+在面板创建表单中先选择实例类型，再选择镜像。机型菜单始终展示预设选项，不会因默认选择 T3 而隐藏 T4g。创建 T4g 实例时使用 `arm64` 镜像，T2 / T3 使用 `x86_64` 镜像。镜像建议分别保留两种架构最新的最多 5 个 Amazon Linux 2023 AMI；切换机型后会清空已知不兼容的 AMI，手填的其他 AMI 会由后端查询 AWS 后校验。初始化脚本中下载的程序也须适配所选架构。机型名称与架构参见 [AWS T4g 官方说明](https://aws.amazon.com/ec2/instance-types/t4/)。
 
 若使用本项目早期 IAM 示例，创建实例现在还需 `ec2:DescribeInstanceTypes` 读取权限；自动创建安全组还需 `ec2:DescribeVpcs`、`ec2:CreateSecurityGroup`、`ec2:AuthorizeSecurityGroupIngress`，以及创建安全组时的 `ec2:CreateTags` 权限。更新后的 IAM 示例默认限制在 `us-east-1`；管理其他区域时请按实际区域调整 `aws:RequestedRegion`。更改默认区域不会迁移已有资源，Cron 时区仍独立配置。
 

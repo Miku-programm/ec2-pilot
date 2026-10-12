@@ -27,7 +27,7 @@ from .scheduling import next_run
 from .rotation_policy import qualifying_failure
 from .leases import keep_lease
 
-VERSION = "1.1.2"
+VERSION = "1.1.3"
 BASE = Path(__file__).resolve().parent.parent
 COOKIE = "ec2_panel_session"
 
