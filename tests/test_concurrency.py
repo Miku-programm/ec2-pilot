@@ -52,7 +52,7 @@ def test_duplicate_account_entries_serialize_rotation_of_same_aws_instance(tmp_p
         def validate(self):
             return {"aws_account_id": "123456789012", "arn": "arn:aws:iam::123456789012:user/test"}
 
-        def rotate_ip(self, target_id, release_previous=False):
+        def rotate_ip(self, target_id, before_allocate=None):
             assert target_id == instance_id
             with observer_guard:
                 calls.append(target_id)

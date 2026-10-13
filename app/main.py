@@ -6,6 +6,7 @@ import hmac
 import ipaddress
 import json
 import os
+import re
 import secrets
 import threading
 import time
@@ -19,7 +20,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from .aws_service import AwsService
+from .aws_service import AwsService, TRANSIENT_READ_ERRORS
 from .models import Password, Account, Script, Launch, Rotate, Monitor, MonitorPatch, Probe, UserData
 from .probing import tcp_probe, remote_probe, classify_gfw, validate_remote_url
 from .store import Store, now, uid
@@ -27,9 +28,16 @@ from .scheduling import next_run
 from .rotation_policy import qualifying_failure
 from .leases import keep_lease
 
-VERSION = "1.1.4"
+VERSION = "1.1.5"
 BASE = Path(__file__).resolve().parent.parent
 COOKIE = "ec2_panel_session"
+
+
+class RotationDeferred(HTTPException):
+    """A known conflict before AllocateAddress; safe to retry next schedule."""
+
+    def __init__(self):
+        super().__init__(409, "当前账号或旧 EIP 正在处理或已不可用，未分配新地址，请稍后重试")
 
 
 def hash_password(password, salt=None):
@@ -48,7 +56,8 @@ def iso_timestamp(value):
     return datetime.fromtimestamp(value, timezone.utc).isoformat()
 
 
-def create_app(data_dir=None, *, start_scheduler=True, aws_factory=AwsService, scheduler_tick=5, rotation_verify_delay=2):
+def create_app(data_dir=None, *, start_scheduler=True, aws_factory=AwsService, scheduler_tick=5, rotation_verify_delay=2,
+               release_wait_seconds=30, release_poll_interval=2, cleanup_interval=60):
     attempts = defaultdict(deque)
     login_lock = threading.Lock()
     mutation_locks = defaultdict(threading.Lock)
@@ -221,6 +230,123 @@ def create_app(data_dir=None, *, start_scheduler=True, aws_factory=AwsService, s
                 raise HTTPException(400, str(exc)) from None
             raise HTTPException(502, "AWS 请求失败，请检查网络、区域及服务权限") from None
 
+    # ---- Old-EIP release: intent before allocation, owner-leased processing ----
+
+    def cleanup_intent_hook(account_id, instance_id, attempt_id, recorded, resource_token):
+        """Runs inside rotate_ip after the read-only lookup, before AllocateAddress."""
+        def hook(previous):
+            if not previous:
+                return
+            entry = {**previous, "instance_id": instance_id, "attempt_id": attempt_id}
+            if not store().record_cleanup_intent(account_id, entry, time.time(), resource_token=resource_token):
+                raise RotationDeferred()
+            recorded.append(previous["allocation_id"])
+        return hook
+
+    def process_cleanup(allocation_id, *, wait_seconds=0, due_only=True):
+        """Claim one queued row and try to release it. Returns None if not claimed."""
+        claimed = store().claim_cleanup(allocation_id, time.time(), due_only=due_only)
+        if not claimed:
+            return None
+        token, entry = claimed
+        label = entry.get("public_ip") or allocation_id
+
+        def lost():
+            return {"status": "lost", "message": f"旧 EIP {label} 的清理任务所有权已失效，请刷新列表核对"}
+
+        def finish(status, message, level="info", **changes):
+            if not store().finish_cleanup(allocation_id, token, **changes):
+                return lost()
+            store().audit(f"ec2.eip-cleanup.{status}", message, level)
+            return {"status": status, "message": message}
+
+        def stop(status, reason, message, level):
+            return finish(status, message, level, state=status, data={**entry, "last_error": reason}, next_try=1e12)
+
+        def retry(reason):
+            attempts = entry.get("attempts", 0) + 1
+            data = {**entry, "attempts": attempts, "last_error": reason}
+            if attempts >= 10:
+                return finish("failed", f"旧 EIP {label} 多次自动释放未成功（{reason}），已停止重试，请到 AWS 核对后手动处理", "error",
+                              state="failed", data=data, next_try=1e12)
+            if not store().finish_cleanup(allocation_id, token, data=data, next_try=time.time() + min(3600, 60 * 2 ** attempts)):
+                return lost()
+            message = f"旧 EIP {label} 尚未确认释放，已加入待清理队列，后台会继续重试。"
+            if attempts == 1:
+                store().audit("ec2.eip-cleanup.queued", message, "warning")
+            return {"status": "retrying", "message": message}
+
+        def process(owned):
+            account = store().get("accounts", entry["account_id"])
+            if not account:
+                return stop("review", "account_removed", f"面板账号已移除，旧 EIP {label} 未自动释放，请到 AWS 手动处理", "warning")
+            if entry.get("aws_account_id") != account["aws_account_id"] or entry.get("region") != account["region"]:
+                return stop("review", "account_changed", f"旧 EIP {label} 的账号或区域与记录不符，已停止自动释放，请核对", "warning")
+            service = aws(entry["account_id"])
+            deadline = time.monotonic() + wait_seconds
+            while True:
+                try:
+                    status, reason = service.release_check(allocation_id, entry["association_id"]), None
+                except Exception as exc:
+                    code = getattr(exc, "code", None)
+                    if code not in TRANSIENT_READ_ERRORS:
+                        raise
+                    status, reason = "transient", code
+                if not owned.is_set():
+                    return lost()
+                if status not in {"stale", "transient"} or time.monotonic() + release_poll_interval > deadline:
+                    break
+                time.sleep(release_poll_interval)
+            if status == "detached":
+                # Default VPC: ReleaseAddress silently disassociates. Re-confirm the
+                # lease right before the call; the read above is the last check.
+                if not owned.is_set() or not store().renew_cleanup(allocation_id, token, time.time()):
+                    return lost()
+                try:
+                    service.release_address(allocation_id, entry["network_border_group"])
+                except Exception as exc:
+                    code = getattr(exc, "code", None)
+                    if code == "InvalidAllocationID.NotFound":
+                        return finish("gone", f"旧 EIP {label} 已不存在，无需释放", remove=True)
+                    if code == "InvalidIPAddress.InUse":
+                        return stop("review", code, f"旧 EIP {label} 已被重新关联，已停止自动释放并保留，请到 AWS 核对", "warning")
+                    return retry(code or "release_failed")
+                return finish("released", f"旧 EIP {label} 已释放，无法保证再次取回", remove=True)
+            if status == "gone":
+                return finish("gone", f"旧 EIP {label} 已不存在，无需释放", remove=True)
+            if status in {"reused", "unclear"}:
+                return stop("review", status, f"旧 EIP {label} 已被重新关联或状态不明确，已停止自动释放并保留，请到 AWS 核对", "warning")
+            return retry(reason or status)
+
+        with keep_lease(lambda: store().renew_cleanup(allocation_id, token, time.time())) as owned:
+            try:
+                return process(owned)
+            except Exception as exc:
+                return retry(getattr(exc, "code", None) or type(exc).__name__)
+
+    def release_after_rotation(recorded, attempt_id):
+        """Called only after AssociateAddress definitely succeeded."""
+        messages = []
+        for allocation_id in recorded:
+            try:
+                if not store().unblock_cleanup(allocation_id, attempt_id, time.time()):
+                    messages.append("旧 EIP 清理记录已变化，未自动释放，请在待清理列表核对。")
+                    continue
+                outcome = process_cleanup(allocation_id, wait_seconds=release_wait_seconds, due_only=False)
+                messages.append(outcome["message"] if outcome else "旧 EIP 已加入待清理队列，后台会继续处理。")
+            except Exception:
+                messages.append("旧 EIP 清理结果未能完整记录，请到 AWS 核对，并查看待清理列表。")
+        return " ".join(messages)
+
+    def run_eip_cleanup():
+        processed = 0
+        for allocation_id in store().due_cleanup(time.time()):
+            if process_cleanup(allocation_id) is not None:
+                processed += 1
+        return processed
+
+    app.state.run_eip_cleanup = run_eip_cleanup
+
     @app.get("/api/state", dependencies=auth)
     def state():
         payload = {name: store().list(name, 100 if name in {"activity", "results"} else None) for name in ["accounts", "scripts", "probes", "monitors", "results", "activity"]}
@@ -229,7 +355,7 @@ def create_app(data_dir=None, *, start_scheduler=True, aws_factory=AwsService, s
                 guard = store().rotation_guard(resource_key(monitor["account_id"], monitor["instance_id"]))
                 if guard.get("state") in {"in_progress", "awaiting_review"}:
                     monitor.update(rotation_status="awaiting_review", rotation_message="换 IP 尚未确认或失败；请核对 AWS 后解除自动更换暂停")
-        return {**payload, "meta": {"default_region": "us-east-1", "server_time": now(), "version": VERSION, "scheduler_mode": os.getenv("PANEL_SCHEDULER", "internal")}}
+        return {**payload, "eip_cleanup": store().list_cleanup(), "meta": {"default_region": "us-east-1", "server_time": now(), "version": VERSION, "scheduler_mode": os.getenv("PANEL_SCHEDULER", "internal")}}
 
     @app.post("/api/accounts", dependencies=auth)
     def add_account(body: Account):
@@ -243,9 +369,15 @@ def create_app(data_dir=None, *, start_scheduler=True, aws_factory=AwsService, s
     @app.delete("/api/accounts/{account_id}", dependencies=auth)
     def delete_account(account_id: str):
         account = need("accounts", account_id)
-        if any(m["account_id"] == account_id for m in store().list("monitors")):
+        outcome = store().delete_account_if_unused(account_id, time.time())
+        if outcome == "missing":
+            raise HTTPException(404, "记录不存在")
+        if outcome == "monitors":
             raise HTTPException(409, "请先删除这个账号关联的检测任务")
-        store().delete("accounts", account_id)
+        if outcome == "cleanup":
+            raise HTTPException(409, "这个账号仍有待处理的旧 EIP，请先在网络监测页处理待释放列表")
+        if outcome == "busy":
+            raise HTTPException(409, "这个账号的 AWS 资源正在操作，请等待操作完成后再移除")
         store().audit("account.delete", f"移除面板账号 {account['name']}，AWS 资源未改变")
         return {"ok": True}
 
@@ -299,9 +431,15 @@ def create_app(data_dir=None, *, start_scheduler=True, aws_factory=AwsService, s
     # Register this before generic action at runtime (see route ordering below).
     @app.post("/api/accounts/{account_id}/instances/{instance_id}/rotate-ip", dependencies=auth)
     def rotate_ip(account_id: str, instance_id: str, body: Rotate):
-        with mutation_lock(account_id, instance_id):
-            result = aws_call(lambda: aws(account_id).rotate_ip(instance_id, body.release_previous))
-        store().audit("ec2.rotate-ip", f"{instance_id} 换 IP：{result.get('public_ip', '已提交')}")
+        attempt_id, recorded = uid(), []
+        with mutation_lock(account_id, instance_id) as owned:
+            hook = cleanup_intent_hook(account_id, instance_id, attempt_id, recorded, owned.lease_token) if body.release_previous else None
+            result = aws_call(lambda: aws(account_id).rotate_ip(instance_id, before_allocate=hook))
+            store().audit("ec2.rotate-ip", f"{instance_id} 换 IP：{result.get('public_ip', '已提交')}")
+            if recorded:
+                result["message"] = f"{result.get('message', '')} {release_after_rotation(recorded, attempt_id)}".strip()
+            elif result.get("previous_allocation_id"):
+                result["message"] = f"{result.get('message', '')} 原弹性 IP 已保留但不再绑定此实例，可能继续计费并占用配额。".strip()
         return result
 
     # Specific POST /rotate-ip must precede the generic /{action} route.
@@ -449,20 +587,33 @@ def create_app(data_dir=None, *, start_scheduler=True, aws_factory=AwsService, s
                 return reservation
             attempt_id = reservation["attempt_id"]
             outcome = {"status": "awaiting_review", "old_ip": result["target_ip"], "message": "换 IP 结果未确认，请核对 AWS 后解除暂停"}
+            recorded = []
+            hook = cleanup_intent_hook(record["account_id"], record["instance_id"], attempt_id, recorded, resource_owned.lease_token) if latest.get("release_previous", False) else None
             try:
-                changed = aws_call(lambda: aws(record["account_id"]).rotate_ip(record["instance_id"], latest.get("release_previous", False)))
+                changed = aws_call(lambda: aws(record["account_id"]).rotate_ip(record["instance_id"], before_allocate=hook))
                 if not changed.get("public_ip"):
                     raise HTTPException(502, "AWS 未返回新公网地址，请先核对")
                 outcome.update(status="rotated", new_ip=changed["public_ip"], message=changed.get("message", "新 IP 已绑定"))
                 store().finish_rotation(key, attempt_id, outcome, time.time())
                 store().update_monitor(item_id, {"failure_streak": 0, "failure_ip": None, "last_rotation_at": now()}, expected_revision=revision, expected_lease=monitor_token)
                 store().audit("ec2.auto-rotate", f"{record['instance_id']} 自动换 IP：{outcome['old_ip']} → {outcome['new_ip']}")
+            except RotationDeferred as exc:
+                outcome.update(status="skipped", message=exc.detail + "；本轮跳过，下次定时检测会继续")
+                store().finish_rotation(key, attempt_id, outcome, time.time())
+                store().audit("ec2.auto-rotate.deferred", f"{record['instance_id']}：{outcome['message']}", "warning")
+                return outcome
             except Exception as exc:
                 detail = str(exc.detail) if isinstance(exc, HTTPException) else "换 IP 执行或记录失败，结果无法确认"
                 outcome.update(status="awaiting_review", message=detail + "；自动更换已暂停，请核对 AWS 后解除暂停")
                 store().finish_rotation(key, attempt_id, outcome, time.time())
                 store().audit("ec2.auto-rotate.failed", f"{record['instance_id']}：{outcome['message']}", "error")
                 return outcome
+            # Outside the try: a cleanup problem must never mark a confirmed
+            # rotation as failed. A crash before this leaves the intent blocked.
+            if recorded:
+                outcome["message"] += " " + release_after_rotation(recorded, attempt_id)
+            elif changed.get("previous_allocation_id"):
+                outcome["message"] += " 原弹性 IP 已保留但不再绑定此实例，可能继续计费并占用配额。"
             if rotation_verify_delay:
                 time.sleep(rotation_verify_delay)
             # Do not recurse or rotate again when the new address fails its check.
@@ -533,6 +684,7 @@ def create_app(data_dir=None, *, start_scheduler=True, aws_factory=AwsService, s
     app.state.run_due_monitors = run_due_monitors
 
     async def scheduler(app):
+        last_cleanup = 0.0
         while True:
             batch = asyncio.create_task(run_due_monitors())
             try:
@@ -542,6 +694,16 @@ def create_app(data_dir=None, *, start_scheduler=True, aws_factory=AwsService, s
                 raise
             except Exception:
                 store().audit("scheduler.error", "调度执行异常，将在下次检查到期任务", "error")
+            if time.monotonic() - last_cleanup >= cleanup_interval:
+                last_cleanup = time.monotonic()
+                cleanup = asyncio.create_task(asyncio.to_thread(run_eip_cleanup))
+                try:
+                    await asyncio.shield(cleanup)
+                except asyncio.CancelledError:
+                    await cleanup
+                    raise
+                except Exception:
+                    store().audit("eip-cleanup.error", "旧 EIP 清理执行异常，将在下次重试", "error")
             await asyncio.sleep(scheduler_tick)
 
     @app.post("/api/probes", dependencies=auth)
@@ -560,6 +722,33 @@ def create_app(data_dir=None, *, start_scheduler=True, aws_factory=AwsService, s
     def delete_probe(item_id: str):
         need("probes", item_id)
         store().delete("probes", item_id)
+        return {"ok": True}
+
+    def cleanup_id(allocation_id):
+        if not re.fullmatch(r"eipalloc-(?:[0-9a-f]{8}|[0-9a-f]{17})", allocation_id):
+            raise HTTPException(422, "无效的 EIP 分配 ID")
+        return allocation_id
+
+    @app.delete("/api/eip-cleanup/{allocation_id}", dependencies=auth)
+    def keep_eip(allocation_id: str):
+        outcome = store().dismiss_cleanup(cleanup_id(allocation_id), time.time())
+        if outcome == "busy":
+            raise HTTPException(409, "后台或换 IP 操作正在处理这个 EIP，请稍后再试")
+        if outcome == "missing":
+            raise HTTPException(404, "记录不存在")
+        store().audit("ec2.eip-cleanup.kept", f"管理员选择保留旧 EIP {allocation_id}，不再自动释放")
+        return {"ok": True}
+
+    @app.post("/api/eip-cleanup/{allocation_id}/approve", dependencies=auth)
+    def approve_eip_release(allocation_id: str):
+        outcome = store().approve_cleanup(cleanup_id(allocation_id), time.time())
+        if outcome == "busy":
+            raise HTTPException(409, "后台或换 IP 操作正在处理这个 EIP，请稍后再试")
+        if outcome == "missing":
+            raise HTTPException(404, "记录不存在")
+        if outcome == "invalid":
+            raise HTTPException(409, "当前状态不允许重新排队")
+        store().audit("ec2.eip-cleanup.approved", f"管理员已核对 AWS，允许自动释放旧 EIP {allocation_id}")
         return {"ok": True}
 
     app.mount("/", StaticFiles(directory=BASE / "static", html=True), name="static")

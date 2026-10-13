@@ -17,6 +17,14 @@ from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
 
 
+EIP_TAGS = [{"Key": "ManagedBy", "Value": "ec2-panel"}]
+# Read-only describes may be retried by callers; mutations never are.
+TRANSIENT_READ_ERRORS = frozenset({
+    "AwsTransportError", "RequestLimitExceeded", "Throttling",
+    "InternalError", "Unavailable", "ServiceUnavailable",
+})
+
+
 class AwsError(Exception):
     def __init__(self, code: str, message: str):
         self.code = code
@@ -314,9 +322,34 @@ class AwsService:
     def _unassociated(address: dict) -> bool:
         return not any(address.get(field) for field in ("AssociationId", "NetworkInterfaceId", "InstanceId"))
 
-    def rotate_ip(self, instance_id: str, release_previous: bool = False) -> dict:
-        if not isinstance(release_previous, bool):
-            raise AwsError("InvalidInput", "release_previous 必须是布尔值。")
+    def _allocate(self, border_group: str, instance_id: str) -> tuple[dict, bool]:
+        """Allocate a tagged EIP; returns (response, tagged).
+
+        UnauthorizedOperation is an IAM decision made before any address exists,
+        so exactly one untagged retry is safe for older policies without
+        CreateTags. Every other error, including timeouts, is raised unchanged.
+        """
+        tags = [*EIP_TAGS, {"Key": "RotatedFor", "Value": instance_id}]
+        try:
+            response = self._call(self.ec2.allocate_address, Domain="vpc", NetworkBorderGroup=border_group,
+                                  TagSpecifications=[{"ResourceType": "elastic-ip", "Tags": tags}])
+            return response, True
+        except AwsError as exc:
+            if exc.code != "UnauthorizedOperation":
+                raise
+        return self._call(self.ec2.allocate_address, Domain="vpc", NetworkBorderGroup=border_group), False
+
+    def rotate_ip(self, instance_id: str, before_allocate=None) -> dict:
+        """Allocate and associate a new EIP. Old addresses use the cleanup queue.
+
+        A definite association rejection may reclaim the newly allocated,
+        verified unused address; ambiguous outcomes always preserve it.
+
+        ``before_allocate(previous)`` runs after the read-only lookup and before
+        AllocateAddress, so a caller can durably record a release intent first.
+        ``previous`` is None or {allocation_id, association_id, public_ip,
+        network_border_group}. If the callback raises, nothing is allocated.
+        """
         instance = self._instance(instance_id)
         if instance.get("State", {}).get("Name") not in ("running", "stopped"):
             raise AwsError("IncorrectInstanceState", "请等待实例进入 running 或 stopped 状态后再更换 IP。")
@@ -342,10 +375,16 @@ class AwsService:
         previous_matches = [a for a in addresses if a.get("NetworkInterfaceId") == eni_id and a.get("PrivateIpAddress") == private_ip]
         if len(previous_matches) > 1:
             raise AwsError("AmbiguousPreviousAddress", "无法确定原弹性 IP，未分配新地址。")
-        previous = previous_matches[0] if previous_matches else None
-        if previous and (not previous.get("AllocationId") or not previous.get("AssociationId") or previous.get("InstanceId") != instance_id):
+        found = previous_matches[0] if previous_matches else None
+        if found and (not found.get("AllocationId") or not found.get("AssociationId") or found.get("InstanceId") != instance_id):
             raise AwsError("AmbiguousPreviousAddress", "原弹性 IP 的实例归属不明确，未分配新地址。")
-        allocated = self._call(self.ec2.allocate_address, Domain="vpc", NetworkBorderGroup=border_group)
+        previous = None
+        if found:
+            previous = {"allocation_id": _id(found["AllocationId"], "eipalloc"), "association_id": found["AssociationId"],
+                        "public_ip": found.get("PublicIp"), "network_border_group": found.get("NetworkBorderGroup") or border_group}
+        if before_allocate is not None:
+            before_allocate(previous)
+        allocated, tagged = self._allocate(border_group, instance_id)
         allocation_id = allocated.get("AllocationId")
         if not allocation_id or not allocated.get("PublicIp"):
             raise AwsError("IncompleteAllocation", "AWS 分配地址响应不完整，请先到控制台核对弹性 IP，避免重复分配。")
@@ -372,20 +411,43 @@ class AwsService:
             note = "新分配且未绑定的地址已回收。" if cleaned else f"新地址 {allocated['PublicIp']}（{allocation_id}）已保留，可能计费；请先在 AWS 核对关联状态，勿直接重试。"
             raise AwsError(exc.code, f"{exc.message} {note}") from None
         message = "新弹性公网 IP 已绑定至主网卡。公网 IPv4 可能消耗赠金或产生费用。"
-        previous_id = previous.get("AllocationId") if previous else None
-        if previous_id and release_previous:
-            try:
-                current = self._call(self.ec2.describe_addresses, AllocationIds=[previous_id]).get("Addresses", [])
-                if len(current) == 1 and current[0].get("AllocationId") == previous_id and self._unassociated(current[0]):
-                    self._call(self.ec2.release_address, AllocationId=previous_id, NetworkBorderGroup=previous.get("NetworkBorderGroup") or border_group)
-                    message += " 原弹性 IP 已释放，无法保证再次取回。"
-                else:
-                    message += " 原弹性 IP 当前仍有关联或状态不明确，已保留；请在 AWS 核对，可能继续计费。"
-            except AwsError as exc:
-                message += f" 原弹性 IP 释放失败（{exc.code}），已保留并可能继续计费，请在 AWS 核对。"
-        elif previous_id:
-            message += " 原弹性 IP 已保留但不再绑定此实例，可能继续计费。"
-        else:
+        if not tagged:
+            message += " 带标签的分配请求被拒绝，新 EIP 已按不带标签的方式分配；请检查 ec2:CreateTags 等授权，控制台中需按 IP 识别。"
+        if not previous:
             message += " 若原 IP 为自动分配的公网地址，它将被 AWS 释放。"
-        return {"public_ip": allocated["PublicIp"], "allocation_id": allocation_id,
-                "previous_allocation_id": previous_id, "message": message}
+        return {"public_ip": allocated["PublicIp"], "allocation_id": allocation_id, "tagged": tagged,
+                "previous_allocation_id": previous["allocation_id"] if previous else None,
+                "previous": previous, "message": message}
+
+    def release_check(self, allocation_id: str, expected_association_id: str) -> str:
+        """One read for the cleanup queue. Never mutates.
+
+        detached - unassociated, may be released
+        stale    - still shows the association recorded before rotation
+                   (EC2 eventual consistency, or the rotation did not happen)
+        reused   - associated under a different AssociationId: someone reused it
+        gone     - allocation no longer exists
+        unclear  - unexpected response
+        Transient read errors are raised for the caller to retry.
+        """
+        allocation_id = _id(allocation_id, "eipalloc")
+        try:
+            found = self._call(self.ec2.describe_addresses, AllocationIds=[allocation_id]).get("Addresses", [])
+        except AwsError as exc:
+            if exc.code == "InvalidAllocationID.NotFound":
+                return "gone"
+            raise
+        if len(found) != 1 or found[0].get("AllocationId") != allocation_id:
+            return "unclear"
+        address = found[0]
+        if self._unassociated(address):
+            return "detached"
+        if address.get("AssociationId") and address.get("AssociationId") == expected_association_id:
+            return "stale"
+        return "reused"
+
+    def release_address(self, allocation_id: str, network_border_group: str) -> None:
+        """Unconditional ReleaseAddress. In a default VPC AWS disassociates an
+        associated address instead of refusing, so callers must call
+        release_check immediately before and hold an exclusive lease."""
+        self._call(self.ec2.release_address, AllocationId=_id(allocation_id, "eipalloc"), NetworkBorderGroup=network_border_group)

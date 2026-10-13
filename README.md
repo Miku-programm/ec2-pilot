@@ -9,7 +9,7 @@
 - ARM 实例：机型下拉菜单按 ARM64 / x86_64 分组，直接提供 `t4g.micro`、`t4g.small`，其他机型可选择“其他机型（手动输入）”；按架构筛选 Amazon Linux 2023 镜像，并在创建前校验 AMI 与实例类型的架构是否匹配。
 - 新建实例默认新建专用安全组，放行 IPv4 / IPv6 任意来源的所有入站协议和端口；可取消“全部开放”并选择已有安全组。
 - 脚本模板和 User Data：新实例启动时提交脚本；已停止实例可以修改 User Data。
-- 更换 IP：为主网卡分配并绑定新 Elastic IP，可选释放之前的 EIP。
+- 更换 IP：为主网卡分配并绑定新 Elastic IP，可选释放之前的 EIP；持久化旧地址释放队列，失败后按退避计划重试，界面显示待处理地址与操作。
 - TCPing：真实 TCP 连接采样，展示成功次数、平均延迟、连接失败率和历史。
 - Cron 定期检测：标准五段表达式与 IANA 时区，默认 `*/5 * * * *`、`Asia/Shanghai`；兼容旧秒数间隔任务。SQLite 持久化，关闭网页不影响执行，每轮重新读取当前公网 IP。
 - 自动更换 IP：连续失败达到阈值后复检，满足条件才分配 / 绑定新 EIP，再检测新 IP。支持本机 TCP 失败或双探针疑似过滤两种触发条件，按定时任务执行，无额外冷却或每日次数限制；结果不确定时暂停。
@@ -86,6 +86,21 @@ docker compose down
 2. 将新 EIP 关联到主网卡。连接会中断，已有 SSH 会话和 DNS 记录需要更新。
 3. 默认保留旧 EIP；只有显式勾选释放，且重新检查确认旧地址未再关联任何资源后，才释放旧 EIP。
 
+### 旧 EIP 待释放队列
+
+勾选“释放旧 EIP”后，旧地址的释放由持久化队列跟踪；新 IP 关联成功后立即尝试，未完成的释放交给后台继续处理：
+
+1. 查到旧 EIP 后、分配新 EIP **之前**，先持久保存释放意图，记下旧 EIP 当时的关联 ID（AssociationId）、账号、区域与本次换 IP 标识。保存失败则不分配新地址；进程中断后可从记录核对未完成操作。
+2. 只有新 EIP 确认关联成功，记录才变为“排队”。正在执行换 IP 时显示执行中，不能手动变更该记录。换 IP 失败或结果不确定时，后台不会自动释放；在 AWS 核对后，于网络监测页点“已核对，允许释放”或“保留此 EIP”。
+3. 排队后立即尝试释放：最多轮询等待 30 秒，等 AWS 显示旧 EIP 已解绑；AWS 请求耗时另计。仍显示原关联或请求失败时按退避重试（后台每分钟检查，最长间隔 1 小时，累计 10 次未成功后停止自动清理，核对后可重新排队）。**这个限制只针对旧 EIP 清理重试，不限制 Cron 自动换 IP，也没有新增换 IP 冷却。**
+4. 每次释放前重新查询：仍是原关联 ID 视为读取延迟，继续等待；**变成其他关联 ID 视为已被重新使用，停止自动释放并保留提示**；未关联才释放。
+5. 处理时持有可续期、带所有者标识的租约；过期工作器不能修改或删除新意图。内置调度器与系统 cron 使用同一个队列，后台处理或换 IP 进行中无法“保留”或“允许释放”。冲突会显示提示并刷新状态；换 IP 在分配前遇到清理繁忙时跳过本轮，由下次定时检测重试。正常关闭后端时会等待已经开始的清理完成。
+6. 网络监测页显示地址所属账号、区域、实例，以及排队、待核对、已停止重试等状态。存在待处理记录时不能删除对应账号，避免丢失继续核查地址所需的凭据。
+
+默认 VPC 中 `ReleaseAddress` 会直接解绑已关联的地址而不是报错（见 [AWS 文档](https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_ReleaseAddress.html)），而 AWS 没有“仅未关联时释放”的条件调用，所以“最后一次查询”与“释放”之间仍存在竞态，无法保证这段时间的长度，也无法阻止其他工具在此期间重新关联地址。若有人在两次轮询之间先关联、又解绑了该地址，面板无法察觉。队列只包含你选择释放的旧地址，不扫描其他闲置 EIP。如果希望自己决定旧地址的最终处理，保持“释放旧 EIP”不勾选即可；新建任务和已有任务都不会被升级自动改成释放。
+
+新分配的 EIP 尝试带上 `ManagedBy=ec2-panel` 与 `RotatedFor=<实例 ID>` 标签，需要 `ec2:CreateTags`（`ec2:CreateAction=AllocateAddress`）。带标签分配被明确拒绝 `UnauthorizedOperation` 时，仅重试一次不带标签的分配，以兼容缺少创建标签权限的策略；其他 AWS 权限或 SCP 拒绝仍会生效，超时等不确定结果不会触发这次重试。
+
 新旧公网 IPv4 都可能计费。AWS 请求超时或返回结果不确定时不会盲目重试或释放可能已经关联的地址；错误消息会提示先到 AWS 核对。
 
 ## Cron 定时检测与自动换 IP
@@ -118,7 +133,7 @@ docker compose down
 
 ### 可选：使用 Linux 系统 crontab
 
-已附 `deploy/panel.crontab` 和单次工作器 `python -m app.cron_worker --once`。它们与页面后端使用同一执行流程、数据库租约和连续失败判断。
+已附 `deploy/panel.crontab` 和单次工作器 `python -m app.cron_worker --once`。它们与页面后端使用同一执行流程、数据库租约和连续失败判断，也处理同一个旧 EIP 释放队列。
 
 先按本机启动步骤安装依赖，并至少启动一次面板生成数据目录。以运行面板的同一个系统用户操作：
 
@@ -175,11 +190,12 @@ API 不返回原始 AK/SK，浏览器不将它们保存到 localStorage。操作
 .venv/bin/python -m pytest -q
 ```
 
-IP 类型与释放选项的浏览器回归检查（使用模拟 API，不连接 AWS）：
+IP 类型、释放选项和旧 EIP 队列的浏览器回归检查（使用模拟 API，不连接 AWS）：
 
 ```bash
 .venv/bin/python -m playwright install chromium
 .venv/bin/python tests/browser_ip_labels.py
+.venv/bin/python tests/browser_eip_cleanup.py
 ```
 
 自动化测试用 Stubber / 假 AWS 客户端验证参数、状态、失败清理、加密、认证、动态 IP、后台调度和探针行为，不创建真实 EC2、不分配真实 EIP。真实 AWS 操作需你在面板中添加自己的密钥后验证。
@@ -187,5 +203,7 @@ IP 类型与释放选项的浏览器回归检查（使用模拟 API，不连接 
 本次交付验证（2026-10-13）：239 项 Python 测试全部通过（包含 Cron、自动换 IP、取消冷却和次数上限、旧配置迁移、重复任务、重启恢复、租约、ARM 镜像匹配、美国区域默认值、安全组创建和重试测试）。Chromium 浏览器检查通过桌面 / 390px 手机布局、导航与弹窗、首次设置与登录退出、脚本增删改和只读演示隔离；新增 Cron / 自动换 IP 表单、开关、规则提交、暂停解除及手机布局也通过隔离浏览器检查；ARM 镜像筛选、默认美国区域、安全组默认开放 / 自定义组提交、资源请求竞态与移动端布局通过隔离浏览器检查；无 JavaScript 页面错误。Linux cron 单次工作器已在空数据目录执行通过。JavaScript 语法、启动 shell 脚本和 IAM JSON 校验通过。测试环境为 Python 3.14；存在一条 Starlette 测试客户端的弃用提示，不影响测试结果。当前环境没有 Docker，Dockerfile / Compose 已提供但未实际构建容器；Windows 启动批处理和真实 AWS 操作尚未实机验证。
 
 2026-10-14（v1.1.4）：239 项 Python 测试通过；新增可复跑的浏览器回归脚本，8 组场景覆盖 IP 类型未知 / 已知 EIP / 无公网 IP、释放选项提交、无额外查询、复检状态、手机布局及只读演示。浏览器请求全部模拟，未操作真实 AWS。
+
+2026-10-14（v1.1.5）：289 项 Python 测试通过，覆盖旧 EIP 持久化清理、过期所有者隔离、账号删除并发、分配前冲突后下轮恢复、退出等待和外部 cron。浏览器回归共 19 组通过（原 IP 展示 8 组、新清理列表 11 组），包含状态操作、409 冲突、重复点击防护、内容转义和手机布局。所有 AWS 调用均为测试替身；未在真实 AWS 上执行换 IP，也未构建 Docker 容器。
 
 参考：[aws.sb 公开 API](https://api.aws.sb/)、[AWS 项目 SCP](https://docs.aws.amazon.com/accounts/latest/reference/scps-and-rcps-for-projects.html)、[EC2 User Data](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/user-data.html)、[Elastic IP](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/elastic-ip-addresses-eip.html)。本项目为独立实现，与 aws.sb 无隶属关系。

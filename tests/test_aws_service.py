@@ -58,13 +58,19 @@ def expect_rotate_prelude(stub, previous=True):
     expect_border_group(stub)
     stub.add_response("describe_addresses", {"Addresses": [old_address()] if previous else []},
                       {"Filters": [{"Name": "network-interface-id", "Values": [ENI]}]})
-    stub.add_response("allocate_address", {"AllocationId": NEW, "PublicIp": NEW_IP, "Domain": "vpc"}, {"Domain": "vpc", "NetworkBorderGroup": "ap-southeast-2"})
+    stub.add_response("allocate_address", {"AllocationId": NEW, "PublicIp": NEW_IP, "Domain": "vpc"}, ALLOCATE_TAGGED)
 
 
 def expect_border_group(stub, zone_name="ap-southeast-2a", border_group="ap-southeast-2", zone_type="availability-zone"):
     stub.add_response("describe_availability_zones", {"AvailabilityZones": [{"ZoneName": zone_name, "NetworkBorderGroup": border_group, "ZoneType": zone_type}]}, {"ZoneNames": [zone_name]})
 
 
+ALLOCATE_TAGGED = {
+    "Domain": "vpc", "NetworkBorderGroup": "ap-southeast-2",
+    "TagSpecifications": [{"ResourceType": "elastic-ip", "Tags": [
+        {"Key": "ManagedBy", "Value": "ec2-panel"}, {"Key": "RotatedFor", "Value": IID},
+    ]}],
+}
 ASSOCIATE_PARAMS = {"AllocationId": NEW, "NetworkInterfaceId": ENI, "PrivateIpAddress": PRIVATE, "AllowReassociation": False}
 
 
@@ -468,7 +474,7 @@ def test_launch_explicit_security_group_is_used_without_modifying_its_rules(serv
         stub.assert_no_pending_responses()
 
 
-def test_rotate_preserves_previous_address_by_default(service, monkeypatch):
+def test_rotate_never_releases_and_reports_previous_address(service, monkeypatch):
     release = Mock(wraps=service.ec2.release_address)
     monkeypatch.setattr(service.ec2, "release_address", release)
     with Stubber(service.ec2) as stub:
@@ -477,39 +483,97 @@ def test_rotate_preserves_previous_address_by_default(service, monkeypatch):
         result = service.rotate_ip(IID)
         assert result["public_ip"] == NEW_IP
         assert result["previous_allocation_id"] == OLD
-        assert "原弹性 IP 已保留" in result["message"]
+        assert result["previous"] == {"allocation_id": OLD, "association_id": "eipassoc-0123456789abcdef0",
+                                      "public_ip": "203.0.113.11", "network_border_group": "ap-southeast-2"}
+        assert result["tagged"] is True
         release.assert_not_called()
         stub.assert_no_pending_responses()
 
 
-def test_rotate_releases_only_verified_old_unassociated_address(service):
+def test_before_allocate_runs_after_lookup_and_can_abort_allocation(service, monkeypatch):
+    allocate = Mock(wraps=service.ec2.allocate_address)
+    monkeypatch.setattr(service.ec2, "allocate_address", allocate)
+    seen = []
+
+    def hook(previous):
+        seen.append(previous)
+        raise RuntimeError("intent could not be stored")
+
     with Stubber(service.ec2) as stub:
-        expect_rotate_prelude(stub)
+        expect_instance(stub)
+        expect_border_group(stub)
+        stub.add_response("describe_addresses", {"Addresses": [old_address()]},
+                          {"Filters": [{"Name": "network-interface-id", "Values": [ENI]}]})
+        with pytest.raises(RuntimeError):
+            service.rotate_ip(IID, before_allocate=hook)
+        assert seen[0]["allocation_id"] == OLD
+        allocate.assert_not_called()
+        stub.assert_no_pending_responses()
+
+
+def test_allocation_falls_back_untagged_only_on_unauthorized(service):
+    with Stubber(service.ec2) as stub:
+        expect_instance(stub)
+        expect_border_group(stub)
+        stub.add_response("describe_addresses", {"Addresses": []},
+                          {"Filters": [{"Name": "network-interface-id", "Values": [ENI]}]})
+        stub.add_client_error("allocate_address", "UnauthorizedOperation", "no CreateTags", expected_params=ALLOCATE_TAGGED)
+        stub.add_response("allocate_address", {"AllocationId": NEW, "PublicIp": NEW_IP, "Domain": "vpc"},
+                          {"Domain": "vpc", "NetworkBorderGroup": "ap-southeast-2"})
         stub.add_response("associate_address", {"AssociationId": "eipassoc-1123456789abcdef0"}, ASSOCIATE_PARAMS)
-        stub.add_response("describe_addresses", {"Addresses": [{"AllocationId": OLD, "Domain": "vpc"}]}, {"AllocationIds": [OLD]})
+        result = service.rotate_ip(IID)
+        assert result["tagged"] is False
+        assert "带标签的分配请求被拒绝" in result["message"]
+        assert "IAM 缺少" not in result["message"]
+        stub.assert_no_pending_responses()
+
+
+def test_allocation_timeout_is_not_retried_untagged(service, monkeypatch):
+    allocate = Mock(side_effect=ReadTimeoutError(endpoint_url="https://ec2.ap-southeast-2.amazonaws.com"))
+    with Stubber(service.ec2) as stub:
+        expect_instance(stub)
+        expect_border_group(stub)
+        stub.add_response("describe_addresses", {"Addresses": []},
+                          {"Filters": [{"Name": "network-interface-id", "Values": [ENI]}]})
+        monkeypatch.setattr(service.ec2, "allocate_address", allocate)
+        with pytest.raises(AwsError) as error:
+            service.rotate_ip(IID)
+        assert error.value.code == "AwsTransportError"
+        assert allocate.call_count == 1
+        stub.assert_no_pending_responses()
+
+
+@pytest.mark.parametrize("address,expected", [
+    ({"AllocationId": OLD, "Domain": "vpc"}, "detached"),
+    (old_address(), "stale"),
+    (old_address(AssociationId="eipassoc-2223456789abcdef0"), "reused"),
+    (old_address(AssociationId="eipassoc-2223456789abcdef0", InstanceId="i-1123456789abcdef0"), "reused"),
+])
+def test_release_check_compares_recorded_association(service, address, expected):
+    with Stubber(service.ec2) as stub:
+        stub.add_response("describe_addresses", {"Addresses": [address]}, {"AllocationIds": [OLD]})
+        assert service.release_check(OLD, "eipassoc-0123456789abcdef0") == expected
+        stub.assert_no_pending_responses()
+
+
+def test_release_check_gone_unclear_and_transient(service):
+    with Stubber(service.ec2) as stub:
+        stub.add_client_error("describe_addresses", "InvalidAllocationID.NotFound", "gone", expected_params={"AllocationIds": [OLD]})
+        assert service.release_check(OLD, "eipassoc-0123456789abcdef0") == "gone"
+        stub.add_response("describe_addresses", {"Addresses": []}, {"AllocationIds": [OLD]})
+        assert service.release_check(OLD, "eipassoc-0123456789abcdef0") == "unclear"
+        stub.add_client_error("describe_addresses", "RequestLimitExceeded", "slow down", expected_params={"AllocationIds": [OLD]})
+        with pytest.raises(AwsError) as error:
+            service.release_check(OLD, "eipassoc-0123456789abcdef0")
+        assert error.value.code == "RequestLimitExceeded"
+        stub.assert_no_pending_responses()
+
+
+def test_release_address_passes_border_group(service):
+    with Stubber(service.ec2) as stub:
         stub.add_response("release_address", {}, {"AllocationId": OLD, "NetworkBorderGroup": "ap-southeast-2"})
-        assert "原弹性 IP 已释放" in service.rotate_ip(IID, release_previous=True)["message"]
+        service.release_address(OLD, "ap-southeast-2")
         stub.assert_no_pending_responses()
-
-
-def test_rotate_never_releases_old_ip_that_became_attached_elsewhere(service):
-    with Stubber(service.ec2) as stub:
-        expect_rotate_prelude(stub)
-        stub.add_response("associate_address", {"AssociationId": "eipassoc-1123456789abcdef0"}, ASSOCIATE_PARAMS)
-        stub.add_response("describe_addresses", {"Addresses": [old_address(InstanceId="i-1123456789abcdef0")]}, {"AllocationIds": [OLD]})
-        assert "状态不明确" in service.rotate_ip(IID, release_previous=True)["message"]
-        stub.assert_no_pending_responses()
-
-
-def test_rotate_partial_success_returns_success_and_release_warning(service):
-    with Stubber(service.ec2) as stub:
-        expect_rotate_prelude(stub)
-        stub.add_response("associate_address", {"AssociationId": "eipassoc-1123456789abcdef0"}, ASSOCIATE_PARAMS)
-        stub.add_response("describe_addresses", {"Addresses": [{"AllocationId": OLD}]}, {"AllocationIds": [OLD]})
-        stub.add_client_error("release_address", "UnauthorizedOperation", "denied", expected_params={"AllocationId": OLD, "NetworkBorderGroup": "ap-southeast-2"})
-        result = service.rotate_ip(IID, release_previous=True)
-        assert result["allocation_id"] == NEW
-        assert "释放失败" in result["message"]
 
 
 def test_definite_association_denial_cleans_only_verified_unused_new_eip(service):
@@ -594,7 +658,7 @@ def test_local_zone_allocates_from_its_actual_network_border_group(service):
         expect_instance(stub, instance(Placement={"AvailabilityZone": "ap-southeast-2-per-1a"}))
         expect_border_group(stub, "ap-southeast-2-per-1a", "ap-southeast-2-per-1", "local-zone")
         stub.add_response("describe_addresses", {"Addresses": []}, {"Filters": [{"Name": "network-interface-id", "Values": [ENI]}]})
-        stub.add_response("allocate_address", {"AllocationId": NEW, "PublicIp": NEW_IP, "Domain": "vpc"}, {"Domain": "vpc", "NetworkBorderGroup": "ap-southeast-2-per-1"})
+        stub.add_response("allocate_address", {"AllocationId": NEW, "PublicIp": NEW_IP, "Domain": "vpc"}, {**ALLOCATE_TAGGED, "NetworkBorderGroup": "ap-southeast-2-per-1"})
         stub.add_response("associate_address", {"AssociationId": "eipassoc-1123456789abcdef0"}, ASSOCIATE_PARAMS)
         assert service.rotate_ip(IID)["public_ip"] == NEW_IP
         stub.assert_no_pending_responses()

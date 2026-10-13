@@ -9,7 +9,8 @@ async def run():
     app = create_app(start_scheduler=False)
     async with app.router.lifespan_context(app):
         results = await app.state.run_due_monitors()
-        print(json.dumps({"checked": len(results), "rotated": sum(r.get("rotation", {}).get("status") == "rotated" for r in results), "needs_review": sum(r.get("rotation", {}).get("status") == "awaiting_review" for r in results)}))
+        cleaned = await asyncio.to_thread(app.state.run_eip_cleanup)
+        print(json.dumps({"checked": len(results), "rotated": sum(r.get("rotation", {}).get("status") == "rotated" for r in results), "needs_review": sum(r.get("rotation", {}).get("status") == "awaiting_review" for r in results), "eip_cleanup_processed": cleaned}))
 
 
 if __name__ == "__main__":

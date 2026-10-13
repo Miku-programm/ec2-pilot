@@ -27,7 +27,7 @@
       "Effect": "Allow",
       "Action": "ec2:CreateTags",
       "Resource": "*",
-      "Condition": {"StringEquals": {"aws:RequestedRegion": "us-east-1", "ec2:CreateAction": ["RunInstances", "CreateSecurityGroup"]}}
+      "Condition": {"StringEquals": {"aws:RequestedRegion": "us-east-1", "ec2:CreateAction": ["RunInstances", "CreateSecurityGroup", "AllocateAddress"]}}
     }
   ]
 }

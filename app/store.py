@@ -2,6 +2,7 @@
 import json
 import os
 import sqlite3
+import time
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -48,6 +49,7 @@ class Store:
                 CREATE TABLE IF NOT EXISTS rotation_attempts (id TEXT PRIMARY KEY, resource_key TEXT NOT NULL, monitor_id TEXT NOT NULL, created_at REAL NOT NULL, data TEXT NOT NULL);
                 CREATE INDEX IF NOT EXISTS rotation_resource_time ON rotation_attempts(resource_key,created_at);
                 CREATE TABLE IF NOT EXISTS resource_leases (resource_key TEXT PRIMARY KEY, token TEXT NOT NULL, expires REAL NOT NULL);
+                CREATE TABLE IF NOT EXISTS eip_cleanup (allocation_id TEXT PRIMARY KEY, account_id TEXT NOT NULL, state TEXT NOT NULL, data TEXT NOT NULL, next_try REAL NOT NULL, lease_token TEXT NOT NULL DEFAULT '', lease_until REAL NOT NULL DEFAULT 0);
             """)
             db.execute("BEGIN IMMEDIATE")
             if "lease_token" not in {row[1] for row in db.execute("PRAGMA table_info(monitors)")}:
@@ -138,6 +140,31 @@ class Store:
         assert table in {"accounts", "scripts", "probes", "monitors"}
         with self.connect() as db:
             db.execute(f"DELETE FROM {table} WHERE id=?", (item_id,))
+
+    def delete_account_if_unused(self, account_id, timestamp):
+        """Check references and remove credentials in one write transaction.
+
+        The same transaction boundary as record_cleanup_intent ensures that a
+        rotation cannot leave a newly written intent without its credentials.
+        Resource leases use the real AWS identity, including other panel aliases.
+        """
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT data FROM accounts WHERE id=?", (account_id,)).fetchone()
+            if not row:
+                return "missing"
+            account = json.loads(row["data"])
+            if any(json.loads(row["data"]).get("account_id") == account_id
+                   for row in db.execute("SELECT data FROM monitors")):
+                return "monitors"
+            if db.execute("SELECT 1 FROM eip_cleanup WHERE account_id=? LIMIT 1", (account_id,)).fetchone():
+                return "cleanup"
+            prefix = f"{account['aws_account_id']}:{account['region']}:"
+            if any(row["resource_key"].startswith(prefix) for row in db.execute(
+                    "SELECT resource_key FROM resource_leases WHERE expires>?", (timestamp,))):
+                return "busy"
+            db.execute("DELETE FROM accounts WHERE id=?", (account_id,))
+            return "deleted"
 
     def audit(self, action, message, level="info"):
         self.put("activity", {"id": uid(), "action": action, "message": message, "level": level, "created_at": now()})
@@ -244,7 +271,9 @@ class Store:
             guard = json.loads(row[0]) if row else {}
             if guard.get("attempt_id") != attempt_id:
                 raise RuntimeError("Rotation reservation changed before completion")
-            guard["state"] = "ready" if outcome["status"] == "rotated" else "awaiting_review"
+            # A known pre-allocation abort did not send a mutation to AWS and
+            # must not pause the monitor as if an AWS outcome were uncertain.
+            guard["state"] = "ready" if outcome["status"] in {"rotated", "skipped"} else "awaiting_review"
             guard["message"] = outcome.get("message", "")
             if outcome["status"] == "rotated":
                 guard["last_rotation_at"] = timestamp
@@ -261,3 +290,141 @@ class Store:
             guard.update(state="ready", message="管理员已核对并解除暂停")
             db.execute("INSERT OR REPLACE INTO rotation_guards VALUES (?,?)", (key, json.dumps(guard, ensure_ascii=False)))
             return True
+
+    # ---- Old-EIP release queue ------------------------------------------------
+    # Only addresses the user chose to release ever enter this table.
+    # States: blocked (rotation not yet confirmed; never processed), queued,
+    # review (reused/unclear; automatic cleanup stopped), failed (retries exhausted).
+    # Every AWS action happens under an owner lease; dismiss/approve/update
+    # refuse to touch a row whose lease is live.
+
+    CLEANUP_LEASE_SECONDS = 300
+
+    def record_cleanup_intent(self, account_id, entry, timestamp, *, resource_token=None):
+        """Write a blocked intent BEFORE AllocateAddress. Returns False if a
+        worker owns the row or its account was deleted (caller must abort)."""
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT data FROM accounts WHERE id=?", (account_id,)).fetchone()
+            if not row:
+                return False
+            account = json.loads(row["data"])
+            if resource_token is not None:
+                key = f"{account['aws_account_id']}:{account['region']}:{entry.get('instance_id', '')}"
+                owned = db.execute("SELECT 1 FROM resource_leases WHERE resource_key=? AND token=? AND expires>?",
+                                   (key, resource_token, timestamp)).fetchone()
+                if not owned:
+                    return False
+            data = {**entry, "account_id": account_id, "aws_account_id": account["aws_account_id"],
+                    "region": account["region"], "created_at": timestamp, "attempts": 0, "last_error": None}
+            packed = json.dumps(data, ensure_ascii=False)
+            cursor = db.execute(
+                "INSERT INTO eip_cleanup(allocation_id,account_id,state,data,next_try) VALUES (?,?,'blocked',?,1e12) "
+                "ON CONFLICT(allocation_id) DO UPDATE SET account_id=excluded.account_id,state='blocked',data=excluded.data,next_try=1e12,lease_token='',lease_until=0 "
+                "WHERE eip_cleanup.lease_until<?",
+                (entry["allocation_id"], account_id, packed, timestamp))
+            return cursor.rowcount == 1
+
+    def unblock_cleanup(self, allocation_id, attempt_id, timestamp):
+        """Rotation confirmed: make the intent eligible. Only the matching attempt
+        may unblock it, so a stale caller cannot release a newer intent."""
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT data,state FROM eip_cleanup WHERE allocation_id=?", (allocation_id,)).fetchone()
+            if not row or row["state"] != "blocked" or json.loads(row["data"]).get("attempt_id") != attempt_id:
+                return False
+            db.execute("UPDATE eip_cleanup SET state='queued',next_try=? WHERE allocation_id=?", (timestamp, allocation_id))
+            return True
+
+    def claim_cleanup(self, allocation_id, timestamp, due_only=True):
+        """Atomically take ownership of one queued row. Returns (token, data) or None."""
+        token = uid()
+        with self.connect() as db:
+            cursor = db.execute(
+                "UPDATE eip_cleanup SET lease_token=?,lease_until=? WHERE allocation_id=? AND state='queued' AND lease_until<?"
+                + (" AND next_try<=?" if due_only else ""),
+                (token, timestamp + self.CLEANUP_LEASE_SECONDS, allocation_id, timestamp) + ((timestamp,) if due_only else ()))
+            if cursor.rowcount != 1:
+                return None
+            row = db.execute("SELECT data FROM eip_cleanup WHERE allocation_id=?", (allocation_id,)).fetchone()
+        return token, json.loads(row[0])
+
+    def renew_cleanup(self, allocation_id, token, timestamp):
+        """Re-confirm ownership immediately before an AWS mutation."""
+        with self.connect() as db:
+            return db.execute(
+                "UPDATE eip_cleanup SET lease_until=? WHERE allocation_id=? AND lease_token=? AND lease_until>? AND state='queued'",
+                (timestamp + self.CLEANUP_LEASE_SECONDS, allocation_id, token, timestamp)).rowcount == 1
+
+    def finish_cleanup(self, allocation_id, token, *, remove=False, state=None, data=None, next_try=None, timestamp=None):
+        """A live queued-row owner may complete; expired owners change nothing."""
+        timestamp = time.time() if timestamp is None else timestamp
+        with self.connect() as db:
+            if remove:
+                return db.execute("DELETE FROM eip_cleanup WHERE allocation_id=? AND lease_token=? AND lease_until>? AND state='queued'", (allocation_id, token, timestamp)).rowcount == 1
+            return db.execute(
+                "UPDATE eip_cleanup SET state=COALESCE(?,state),data=COALESCE(?,data),next_try=COALESCE(?,next_try),lease_token='',lease_until=0 "
+                "WHERE allocation_id=? AND lease_token=? AND lease_until>? AND state='queued'",
+                (state, json.dumps(data, ensure_ascii=False) if data is not None else None, next_try, allocation_id, token, timestamp)).rowcount == 1
+
+    def due_cleanup(self, timestamp, limit=20):
+        with self.connect() as db:
+            rows = db.execute("SELECT allocation_id FROM eip_cleanup WHERE state='queued' AND next_try<=? AND lease_until<? ORDER BY next_try LIMIT ?",
+                              (timestamp, timestamp, limit)).fetchall()
+        return [row[0] for row in rows]
+
+    @staticmethod
+    def _cleanup_resource_busy(db, data, timestamp):
+        """A blocked intent may still belong to an in-flight rotation."""
+        identity = data
+        if not data.get("aws_account_id") or not data.get("region"):
+            row = db.execute("SELECT data FROM accounts WHERE id=?", (data.get("account_id"),)).fetchone()
+            identity = json.loads(row["data"]) if row else {}
+        if not identity.get("aws_account_id") or not identity.get("region") or not data.get("instance_id"):
+            return False
+        key = f"{identity['aws_account_id']}:{identity['region']}:{data['instance_id']}"
+        return db.execute("SELECT 1 FROM resource_leases WHERE resource_key=? AND expires>?", (key, timestamp)).fetchone() is not None
+
+    def dismiss_cleanup(self, allocation_id, timestamp):
+        """User keeps the address. Refused while cleanup or rotation is active.
+        Returns 'removed', 'busy' or 'missing'."""
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT data,lease_until FROM eip_cleanup WHERE allocation_id=?", (allocation_id,)).fetchone()
+            if not row:
+                return "missing"
+            if row["lease_until"] >= timestamp or self._cleanup_resource_busy(db, json.loads(row["data"]), timestamp):
+                return "busy"
+            db.execute("DELETE FROM eip_cleanup WHERE allocation_id=?", (allocation_id,))
+            return "removed"
+
+    def approve_cleanup(self, allocation_id, timestamp):
+        """Admin verified AWS: blocked/failed rows become queued again.
+        Returns 'queued', 'busy', 'invalid' or 'missing'."""
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT data,state,lease_until FROM eip_cleanup WHERE allocation_id=?", (allocation_id,)).fetchone()
+            if not row:
+                return "missing"
+            data = json.loads(row["data"])
+            if row["lease_until"] >= timestamp or self._cleanup_resource_busy(db, data, timestamp):
+                return "busy"
+            if row["state"] not in {"blocked", "failed"}:
+                return "invalid"
+            data.update(attempts=0, last_error=None)
+            db.execute("UPDATE eip_cleanup SET state='queued',next_try=?,data=?,lease_token='',lease_until=0 WHERE allocation_id=?",
+                       (timestamp, json.dumps(data, ensure_ascii=False), allocation_id))
+            return "queued"
+
+    def list_cleanup(self, account_id=None):
+        query = "SELECT data,state,next_try,lease_until FROM eip_cleanup" + (" WHERE account_id=?" if account_id else "") + " ORDER BY rowid"
+        timestamp = time.time()
+        with self.connect() as db:
+            rows = db.execute(query, (account_id,) if account_id else ()).fetchall()
+            items = []
+            for row in rows:
+                data = json.loads(row["data"])
+                items.append({**data, "state": row["state"],
+                              "processing": row["lease_until"] > timestamp or self._cleanup_resource_busy(db, data, timestamp),
+                              "next_try_at": datetime.fromtimestamp(row["next_try"], timezone.utc).isoformat() if row["next_try"] < 1e11 else None})
+        return items

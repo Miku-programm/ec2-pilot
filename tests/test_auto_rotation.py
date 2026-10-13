@@ -29,6 +29,12 @@ class Cloud:
         self.rotate_error = None
         self.rotation_hook = None
         self.instances_calls = 0
+        # Old-EIP fake: set ``previous`` to simulate an EIP on the instance.
+        self.previous = None
+        self.release_checks = []          # queued release_check results, consumed in order
+        self.release_check_default = "detached"
+        self.release_calls = []
+        self.release_error = None
 
     def factory(self, credentials, region):
         cloud = self
@@ -44,15 +50,30 @@ class Cloud:
                 return [{"id": INSTANCE, "name": "test", "state": cloud.state,
                          "public_ip": cloud.ip, "instance_type": "t3.micro"}]
 
-            def rotate_ip(self, instance_id, release_previous=False):
+            def rotate_ip(self, instance_id, before_allocate=None):
                 assert instance_id == INSTANCE
-                cloud.rotations.append({"old_ip": cloud.ip, "release_previous": release_previous})
+                cloud.rotations.append({"old_ip": cloud.ip, "release_previous": before_allocate is not None})
+                previous = dict(cloud.previous) if cloud.previous else None
+                if before_allocate is not None:
+                    before_allocate(previous)
                 if cloud.rotation_hook:
                     cloud.rotation_hook()
                 if cloud.rotate_error:
                     raise cloud.rotate_error
                 cloud.ip = f"1.1.1.{len(cloud.rotations)}"
-                return {"public_ip": cloud.ip, "allocation_id": "eipalloc-0123456789abcdef0", "message": "changed"}
+                return {"public_ip": cloud.ip, "allocation_id": "eipalloc-1123456789abcdef0", "message": "changed",
+                        "previous": previous, "previous_allocation_id": previous["allocation_id"] if previous else None}
+
+            def release_check(self, allocation_id, expected_association_id):
+                result = cloud.release_checks.pop(0) if cloud.release_checks else cloud.release_check_default
+                if isinstance(result, Exception):
+                    raise result
+                return result() if callable(result) else result
+
+            def release_address(self, allocation_id, network_border_group):
+                cloud.release_calls.append((allocation_id, network_border_group))
+                if cloud.release_error:
+                    raise cloud.release_error
 
         return Aws()
 

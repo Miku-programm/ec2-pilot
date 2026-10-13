@@ -23,8 +23,8 @@ class FakeAws:
     def instances(self):
         return [{"id": INSTANCE, "name": "test", "state": "running", "public_ip": self.ip, "instance_type": "t3.micro"}]
 
-    def rotate_ip(self, instance_id, release_previous=False):
-        self.calls.append(("rotate", instance_id, release_previous))
+    def rotate_ip(self, instance_id, before_allocate=None):
+        self.calls.append(("rotate", instance_id, before_allocate is not None))
         return {"public_ip": "1.1.1.1", "allocation_id": "eipalloc-0123456789abcdef0", "message": "changed"}
 
     def launch(self, payload):
