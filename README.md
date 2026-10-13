@@ -78,6 +78,10 @@ docker compose down
 
 ## 换 IP 的行为
 
+实例列表只查询 `DescribeInstances`，不额外查询弹性 IP。这个接口的[网卡关联响应](https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_InstanceNetworkInterfaceAssociation.html)不含 `AllocationId`：有公网 IP 但缺少已确认的分配 ID 时，界面显示“公网 IPv4（类型未识别）”；没有公网 IP 时显示“无公网 IPv4”。不要依据未知类型判断停止实例后是否换地址，或是否还会产生 IPv4 费用。
+
+换 IP 窗口中的“未查询”不代表没有旧 EIP。是否存在旧 EIP，以及能否释放，均由后端执行时重新查询并核实；默认保留旧 EIP，只有勾选释放才会在符合条件时释放。
+
 1. 查明实例主网卡和主私网地址，按所在 Network Border Group 分配新 EIP。
 2. 将新 EIP 关联到主网卡。连接会中断，已有 SSH 会话和 DNS 记录需要更新。
 3. 默认保留旧 EIP；只有显式勾选释放，且重新检查确认旧地址未再关联任何资源后，才释放旧 EIP。
@@ -98,6 +102,8 @@ docker compose down
 默认由常驻后端解释 Cron 表达式，每 5 秒检查到期任务，适用于 Windows、本机和 Docker。关闭网页继续运行；关闭后端、电脑休眠时不会执行。重新启动后到期任务补执行一次，再计算下一次 Cron 时间，不批量重放遗漏的检测。任务执行较久时不会重叠，完成后调度下一个未来时间。
 
 自动更换默认要求连续 **3 轮**失败，可在任务中修改。Cron 时间、连续失败阈值和操作前复检共同决定是否更换；没有额外冷却时间，也没有每日或滚动 24 小时次数上限。后续定时检测再次满足条件，即可再次更换。
+
+“复检未触发换 IP”表示操作前复检未满足更换条件，可能是连接恢复、IP 已变化或证据不足（包括临时查询 / 检测错误），并不保证连接已经恢复。这些情况继续采用原有保守策略：清空连续失败计数，本轮不分配 EIP。
 
 1. **TCP 失败触发**：适合目前没有远程探针的情况。每轮所有 TCP 样本均失败才累计；这只表示网络检测失败，不声称确认 GFW。明确的本地权限 / 网络错误、无公网 IP、实例未运行或检测异常不会累计。
 2. **双探针疑似过滤触发**：需要有效国内与境外对照，国内失败且境外成功；探针服务连接失败不算目标被屏蔽。
@@ -169,8 +175,17 @@ API 不返回原始 AK/SK，浏览器不将它们保存到 localStorage。操作
 .venv/bin/python -m pytest -q
 ```
 
+IP 类型与释放选项的浏览器回归检查（使用模拟 API，不连接 AWS）：
+
+```bash
+.venv/bin/python -m playwright install chromium
+.venv/bin/python tests/browser_ip_labels.py
+```
+
 自动化测试用 Stubber / 假 AWS 客户端验证参数、状态、失败清理、加密、认证、动态 IP、后台调度和探针行为，不创建真实 EC2、不分配真实 EIP。真实 AWS 操作需你在面板中添加自己的密钥后验证。
 
 本次交付验证（2026-10-13）：239 项 Python 测试全部通过（包含 Cron、自动换 IP、取消冷却和次数上限、旧配置迁移、重复任务、重启恢复、租约、ARM 镜像匹配、美国区域默认值、安全组创建和重试测试）。Chromium 浏览器检查通过桌面 / 390px 手机布局、导航与弹窗、首次设置与登录退出、脚本增删改和只读演示隔离；新增 Cron / 自动换 IP 表单、开关、规则提交、暂停解除及手机布局也通过隔离浏览器检查；ARM 镜像筛选、默认美国区域、安全组默认开放 / 自定义组提交、资源请求竞态与移动端布局通过隔离浏览器检查；无 JavaScript 页面错误。Linux cron 单次工作器已在空数据目录执行通过。JavaScript 语法、启动 shell 脚本和 IAM JSON 校验通过。测试环境为 Python 3.14；存在一条 Starlette 测试客户端的弃用提示，不影响测试结果。当前环境没有 Docker，Dockerfile / Compose 已提供但未实际构建容器；Windows 启动批处理和真实 AWS 操作尚未实机验证。
+
+2026-10-14（v1.1.4）：239 项 Python 测试通过；新增可复跑的浏览器回归脚本，8 组场景覆盖 IP 类型未知 / 已知 EIP / 无公网 IP、释放选项提交、无额外查询、复检状态、手机布局及只读演示。浏览器请求全部模拟，未操作真实 AWS。
 
 参考：[aws.sb 公开 API](https://api.aws.sb/)、[AWS 项目 SCP](https://docs.aws.amazon.com/accounts/latest/reference/scps-and-rcps-for-projects.html)、[EC2 User Data](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/user-data.html)、[Elastic IP](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/elastic-ip-addresses-eip.html)。本项目为独立实现，与 aws.sb 无隶属关系。
