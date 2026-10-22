@@ -23,6 +23,9 @@ class FakeAws:
     def instances(self):
         return [{"id": INSTANCE, "name": "test", "state": "running", "public_ip": self.ip, "instance_type": "t3.micro"}]
 
+    def instance(self, instance_id):
+        return next((i for i in self.instances() if i["id"] == instance_id), None)
+
     def rotate_ip(self, instance_id, before_allocate=None):
         self.calls.append(("rotate", instance_id, before_allocate is not None))
         return {"public_ip": "1.1.1.1", "allocation_id": "eipalloc-0123456789abcdef0", "message": "changed"}

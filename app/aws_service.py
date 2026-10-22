@@ -75,8 +75,16 @@ class AwsService:
             region_name=region,
         )
         config = Config(connect_timeout=5, read_timeout=20, retries={"mode": "standard", "total_max_attempts": 1})
+        self._config = config
         self.ec2 = self._session.client("ec2", region_name=region, config=config)
-        self.sts = self._session.client("sts", region_name=region, config=config)
+        self._sts = None
+
+    @property
+    def sts(self):
+        # Only account validation needs STS; skip building it for EC2-only use.
+        if self._sts is None:
+            self._sts = self._session.client("sts", region_name=self.region, config=self._config)
+        return self._sts
 
     def _clean_message(self, message: str) -> str:
         for secret in self._secrets:
@@ -119,22 +127,32 @@ class AwsService:
             raise AwsError("InstanceNotFound", "在所选账号与区域内未找到唯一的目标实例。")
         return matches[0]
 
+    @staticmethod
+    def _summary(item: dict) -> dict:
+        return {
+            "id": item["InstanceId"], "name": _name(item, item["InstanceId"]),
+            "state": item.get("State", {}).get("Name", "unknown"),
+            "instance_type": item.get("InstanceType", ""),
+            "public_ip": item.get("PublicIpAddress"), "private_ip": item.get("PrivateIpAddress"),
+            "availability_zone": item.get("Placement", {}).get("AvailabilityZone", ""),
+            "image_id": item.get("ImageId", ""), "launch_time": _iso(item.get("LaunchTime")),
+            "key_name": item.get("KeyName"), "subnet_id": item.get("SubnetId"),
+            "security_group_ids": [g["GroupId"] for g in item.get("SecurityGroups", [])],
+        }
+
     def instances(self) -> list[dict]:
         reservations = self._all("describe_instances", "Reservations")
-        instances = []
-        for reservation in reservations:
-            for item in reservation.get("Instances", []):
-                instances.append({
-                    "id": item["InstanceId"], "name": _name(item, item["InstanceId"]),
-                    "state": item.get("State", {}).get("Name", "unknown"),
-                    "instance_type": item.get("InstanceType", ""),
-                    "public_ip": item.get("PublicIpAddress"), "private_ip": item.get("PrivateIpAddress"),
-                    "availability_zone": item.get("Placement", {}).get("AvailabilityZone", ""),
-                    "image_id": item.get("ImageId", ""), "launch_time": _iso(item.get("LaunchTime")),
-                    "key_name": item.get("KeyName"), "subnet_id": item.get("SubnetId"),
-                    "security_group_ids": [g["GroupId"] for g in item.get("SecurityGroups", [])],
-                })
+        instances = [self._summary(item) for reservation in reservations for item in reservation.get("Instances", [])]
         return sorted(instances, key=lambda item: (item["name"].lower(), item["id"]))
+
+    def instance(self, instance_id: str) -> dict | None:
+        """One instance summary by ID, or None if it is not in this account/region."""
+        try:
+            return self._summary(self._instance(instance_id))
+        except AwsError as exc:
+            if exc.code in {"InstanceNotFound", "InvalidInstanceID.NotFound", "InvalidInstanceID.Malformed", "InvalidInput"}:
+                return None
+            raise
 
     def resources(self) -> dict:
         images = self._all("describe_images", "Images", Owners=["amazon"], Filters=[

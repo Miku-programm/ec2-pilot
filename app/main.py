@@ -10,13 +10,15 @@ import re
 import secrets
 import threading
 import time
-from collections import defaultdict, deque
+from collections import OrderedDict, defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import FastAPI, Depends, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -111,7 +113,14 @@ def create_app(data_dir=None, *, start_scheduler=True, aws_factory=AwsService, s
         response.headers["Content-Security-Policy"] = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
         if request.url.path.startswith("/api/"):
             response.headers["Cache-Control"] = "no-store"
+        else:
+            # Revalidate static files on every load (cheap 304 via ETag) so an
+            # upgrade never leaves the browser running an old index.html/app.js.
+            response.headers.setdefault("Cache-Control", "no-cache")
         return response
+
+    # app.js/styles.css/state JSON compress ~70%. Responses carry no secrets.
+    app.add_middleware(GZipMiddleware, minimum_size=1024)
 
     @app.exception_handler(RequestValidationError)
     async def invalid_input(request, exc):
@@ -192,9 +201,31 @@ def create_app(data_dir=None, *, start_scheduler=True, aws_factory=AwsService, s
             raise HTTPException(404, "记录不存在")
         return item
 
+    aws_cache = OrderedDict()
+    aws_cache_lock = threading.Lock()
+
+    def forget_aws(account_id):
+        with aws_cache_lock:
+            for key in [key for key in aws_cache if key[0] == account_id]:
+                del aws_cache[key]
+
     def aws(account_id):
+        # Building a boto3 session and client costs ~150 ms of CPU; clients are
+        # thread-safe, so reuse them while the account's region and keys match.
         account = need("accounts", account_id, True)
-        return aws_factory(account["credentials"], account["region"])
+        fingerprint = hashlib.sha256(json.dumps([account["region"], account["credentials"]], sort_keys=True).encode()).hexdigest()
+        key = (account_id, fingerprint)
+        with aws_cache_lock:
+            if key in aws_cache:
+                aws_cache.move_to_end(key)
+                return aws_cache[key]
+        service = aws_factory(account["credentials"], account["region"])
+        forget_aws(account_id)
+        with aws_cache_lock:
+            aws_cache[key] = service
+            while len(aws_cache) > 32:
+                aws_cache.popitem(last=False)
+        return service
 
     def resource_key(account_id, resource):
         account = need("accounts", account_id)
@@ -350,9 +381,12 @@ def create_app(data_dir=None, *, start_scheduler=True, aws_factory=AwsService, s
     @app.get("/api/state", dependencies=auth)
     def state():
         payload = {name: store().list(name, 100 if name in {"activity", "results"} else None) for name in ["accounts", "scripts", "probes", "monitors", "results", "activity"]}
+        accounts = {account["id"]: account for account in payload["accounts"]}
+        guards = store().rotation_guards()
         for monitor in payload["monitors"]:
-            if store().get("accounts", monitor["account_id"]):
-                guard = store().rotation_guard(resource_key(monitor["account_id"], monitor["instance_id"]))
+            account = accounts.get(monitor["account_id"])
+            if account:
+                guard = guards.get(f"{account['aws_account_id']}:{account['region']}:{monitor['instance_id']}", {})
                 if guard.get("state") in {"in_progress", "awaiting_review"}:
                     monitor.update(rotation_status="awaiting_review", rotation_message="换 IP 尚未确认或失败；请核对 AWS 后解除自动更换暂停")
         return {**payload, "eip_cleanup": store().list_cleanup(), "meta": {"default_region": "us-east-1", "server_time": now(), "version": VERSION, "scheduler_mode": os.getenv("PANEL_SCHEDULER", "internal")}}
@@ -378,6 +412,7 @@ def create_app(data_dir=None, *, start_scheduler=True, aws_factory=AwsService, s
             raise HTTPException(409, "这个账号仍有待处理的旧 EIP，请先在网络监测页处理待释放列表")
         if outcome == "busy":
             raise HTTPException(409, "这个账号的 AWS 资源正在操作，请等待操作完成后再移除")
+        forget_aws(account_id)
         store().audit("account.delete", f"移除面板账号 {account['name']}，AWS 资源未改变")
         return {"ok": True}
 
@@ -472,8 +507,7 @@ def create_app(data_dir=None, *, start_scheduler=True, aws_factory=AwsService, s
 
     def validate_monitor(body):
         need("accounts", body.account_id)
-        records = aws_call(lambda: aws(body.account_id).instances())
-        if not any(r["id"] == body.instance_id for r in records):
+        if not aws_call(lambda: aws(body.account_id).instance(body.instance_id)):
             raise HTTPException(422, "请选择这个账号、区域内实际存在的 EC2 实例")
 
     @app.post("/api/monitors", dependencies=auth)
@@ -515,8 +549,7 @@ def create_app(data_dir=None, *, start_scheduler=True, aws_factory=AwsService, s
     def observe(record, expected_ip=None):
         result = {"target_ip": None, "status": "error", "success_count": 0, "samples": record["samples"], "latency_ms": None, "loss_percent": None, "gfw_status": "insufficient_evidence", "summary": "", "observations": []}
         try:
-            items = aws_call(lambda: aws(record["account_id"]).instances())
-            instance = next((i for i in items if i["id"] == record["instance_id"]), None)
+            instance = aws_call(lambda: aws(record["account_id"]).instance(record["instance_id"]))
             if not instance:
                 result["summary"] = "实例不存在或不在所选区域"
             elif not (expected_ip or instance.get("public_ip")):
@@ -526,19 +559,26 @@ def create_app(data_dir=None, *, start_scheduler=True, aws_factory=AwsService, s
             else:
                 result["target_ip"] = expected_ip or instance["public_ip"]
                 args = {"target_ip": result["target_ip"], "port": record["port"], "timeout_seconds": record["timeout_seconds"], "samples": record["samples"]}
-                measured = tcp_probe(**args)
+                probes = [probe for probe in store().list("probes") if probe.get("enabled", True)]
+
+                def remote(probe):
+                    try:
+                        token = need("probes", probe["id"], True)["credentials"]["token"]
+                        return {"name": probe["name"], "region_type": probe["region_type"], **remote_probe(probe["url"], token, args)}
+                    except Exception:
+                        return {"name": probe["name"], "region_type": probe["region_type"], "error": "远程探针连接或响应失败"}
+
+                # Each probe can take up to a minute; run them alongside the local
+                # check so one observation costs the slowest probe, not their sum.
+                with ThreadPoolExecutor(max_workers=len(probes) + 1, thread_name_prefix="panel-probe") as pool:
+                    local = pool.submit(tcp_probe, **args)
+                    remotes = [pool.submit(remote, probe) for probe in probes]
+                    measured = local.result()
+                    observed = [future.result() for future in remotes]
                 result.update({key: measured[key] for key in ["success_count", "samples", "latency_ms", "loss_percent"]})
                 result["status"] = "reachable" if measured["success_count"] else "unreachable"
                 result["observations"].append({"name": "面板后端", "region_type": "local", **measured})
-                for probe in store().list("probes"):
-                    if not probe.get("enabled", True):
-                        continue
-                    try:
-                        token = need("probes", probe["id"], True)["credentials"]["token"]
-                        observed = remote_probe(probe["url"], token, args)
-                        result["observations"].append({"name": probe["name"], "region_type": probe["region_type"], **observed})
-                    except Exception:
-                        result["observations"].append({"name": probe["name"], "region_type": probe["region_type"], "error": "远程探针连接或响应失败"})
+                result["observations"].extend(observed)
                 result["gfw_status"] = classify_gfw(result["observations"])
                 result["summary"] = f"本地 TCP {measured['success_count']}/{record['samples']} 次连接成功。"
                 if result["gfw_status"] == "insufficient_evidence":
@@ -684,27 +724,51 @@ def create_app(data_dir=None, *, start_scheduler=True, aws_factory=AwsService, s
     app.state.run_due_monitors = run_due_monitors
 
     async def scheduler(app):
+        # A slow monitor (e.g. one rotating an IP) must not delay the others:
+        # each tick starts monitors that became due and are not already running.
+        # Durable leases still prevent duplicate runs across processes.
+        running = {}
+        cleanup = None
         last_cleanup = 0.0
-        while True:
-            batch = asyncio.create_task(run_due_monitors())
-            try:
-                await asyncio.shield(batch)
-            except asyncio.CancelledError:
-                await batch
-                raise
-            except Exception:
-                store().audit("scheduler.error", "调度执行异常，将在下次检查到期任务", "error")
-            if time.monotonic() - last_cleanup >= cleanup_interval:
-                last_cleanup = time.monotonic()
-                cleanup = asyncio.create_task(asyncio.to_thread(run_eip_cleanup))
+
+        async def scheduled_check(item_id):
+            async with app.state.monitor_slots:
                 try:
-                    await asyncio.shield(cleanup)
-                except asyncio.CancelledError:
-                    await cleanup
-                    raise
+                    await asyncio.to_thread(run_check, item_id, True)
+                except HTTPException:
+                    pass
                 except Exception:
-                    store().audit("eip-cleanup.error", "旧 EIP 清理执行异常，将在下次重试", "error")
-            await asyncio.sleep(scheduler_tick)
+                    store().audit("scheduler.error", "调度执行异常，将在下次检查到期任务", "error")
+
+        async def scheduled_cleanup():
+            try:
+                await asyncio.to_thread(run_eip_cleanup)
+            except Exception:
+                store().audit("eip-cleanup.error", "旧 EIP 清理执行异常，将在下次重试", "error")
+
+        def forget(item_id):
+            return lambda _: running.pop(item_id, None)
+
+        try:
+            while True:
+                try:
+                    due = await asyncio.to_thread(store().due_monitors, time.time())
+                except Exception:
+                    due = []
+                    store().audit("scheduler.error", "调度执行异常，将在下次检查到期任务", "error")
+                for monitor in due:
+                    if monitor["id"] not in running:
+                        running[monitor["id"]] = asyncio.create_task(scheduled_check(monitor["id"]))
+                        running[monitor["id"]].add_done_callback(forget(monitor["id"]))
+                if (cleanup is None or cleanup.done()) and time.monotonic() - last_cleanup >= cleanup_interval:
+                    last_cleanup = time.monotonic()
+                    cleanup = asyncio.create_task(scheduled_cleanup())
+                await asyncio.sleep(scheduler_tick)
+        finally:
+            # Graceful shutdown: started checks and cleanup run to completion.
+            pending = [*running.values(), *([cleanup] if cleanup else [])]
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
 
     @app.post("/api/probes", dependencies=auth)
     def add_probe(body: Probe):

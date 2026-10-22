@@ -50,6 +50,9 @@ class Cloud:
                 return [{"id": INSTANCE, "name": "test", "state": cloud.state,
                          "public_ip": cloud.ip, "instance_type": "t3.micro"}]
 
+            def instance(self, instance_id):
+                return next((i for i in self.instances() if i["id"] == instance_id), None)
+
             def rotate_ip(self, instance_id, before_allocate=None):
                 assert instance_id == INSTANCE
                 cloud.rotations.append({"old_ip": cloud.ip, "release_previous": before_allocate is not None})

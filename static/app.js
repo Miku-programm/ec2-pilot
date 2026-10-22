@@ -45,6 +45,7 @@
   const modal = $('#modal');
   let pollTimer;
   const cleanupActionsPending = new Set();
+  let inFlightRefresh = null, queuedRefresh = null, lastRenderSignature = '', lastRenderAt = 0, lastSyncAt = 0, deferredRender = null, searchTimer = null, composing = false;
   const asArray = value => Array.isArray(value) ? value : [];
   const trim = value => String(value ?? '').trim();
   const newOperationKey = () => { if (crypto.randomUUID) return crypto.randomUUID(); const bytes = crypto.getRandomValues(new Uint8Array(16)); bytes[6]=(bytes[6]&15)|64; bytes[8]=(bytes[8]&63)|128; const hex=[...bytes].map(b=>b.toString(16).padStart(2,'0')).join(''); return `${hex.slice(0,8)}-${hex.slice(8,12)}-${hex.slice(12,16)}-${hex.slice(16,20)}-${hex.slice(20)}`; };
@@ -115,13 +116,23 @@
     }
   }
   function showApp() { $('#boot').hidden=true;$('#auth').hidden=true;$('#app').hidden=false;$('#topbar-demo').hidden=!demo;$('#demo-banner').hidden=!demo;$('#connection-label').textContent=demo?'示例工作空间':'本地后端在线';$('#session-label').textContent=demo?'只读演示会话':'受密码保护的本地会话'; }
-  function startPolling(){clearInterval(pollTimer);pollTimer=setInterval(()=>{if(authenticated&&!modal.open&&!document.hidden)refreshData(false,false).catch(()=>{});},30000);}
-  async function refreshData(notify=false,loadInstances=true){
-    if(demo){render();if(notify)toast('演示数据已就绪。','info');return;}
-    if(refreshing)return;
+  function startPolling(){clearInterval(pollTimer);pollTimer=setInterval(()=>{if(authenticated&&!modal.open&&!document.hidden)refreshData(false,false,true).catch(()=>{});},30000);}
+  // At most one refresh runs at a time. A request made while one is in flight
+  // (typically the 30 s poll, which started before a change was saved) is merged
+  // into a single follow-up refresh instead of being dropped.
+  function refreshData(notify=false,loadInstances=true,fromPoll=false){
+    if(demo){render();if(notify)toast('演示数据已就绪。','info');return Promise.resolve();}
+    if(!refreshing){inFlightRefresh=doRefresh(notify,loadInstances,fromPoll);return inFlightRefresh;}
+    if(queuedRefresh){queuedRefresh.notify||=notify;queuedRefresh.loadInstances||=loadInstances;queuedRefresh.fromPoll&&=fromPoll;return queuedRefresh.promise;}
+    const queued={notify,loadInstances,fromPoll};
+    queued.promise=inFlightRefresh.catch(()=>{}).then(()=>{queuedRefresh=null;inFlightRefresh=doRefresh(queued.notify,queued.loadInstances,queued.fromPoll);return inFlightRefresh;});
+    queuedRefresh=queued;return queued.promise;
+  }
+  async function doRefresh(notify,loadInstances,fromPoll){
     refreshing=true;$('#refresh-icon').classList.add('rotating');
     try{
       const next=await api('/state');
+      if(queuedRefresh)return; // Superseded: the queued refresh renders newer data.
       ['accounts','scripts','monitors','results','activity','probes','eip_cleanup'].forEach(key=>{state[key]=asArray(next[key]);}); state.meta=next.meta||state.meta;
       if(loadInstances){
         const list=await Promise.allSettled(state.accounts.map(async a=>({id:a.id,data:await api(`/accounts/${encodeURIComponent(a.id)}/instances`)})));
@@ -130,8 +141,8 @@
         instances=refreshed;
       }
       $('#connection-label').textContent='本地后端在线';$('.connection-label .signal-dot').classList.remove('error');
-      $('#last-sync').textContent=`上次同步 ${timeOnly(new Date().toISOString())} · 每 30 秒更新检测结果`;
-      render();if(notify)toast(Object.keys(accountErrors).length?'面板已刷新，部分账号的 EC2 数据读取失败。':'数据已同步。',Object.keys(accountErrors).length?'info':'success');
+      $('#last-sync').textContent=`上次同步 ${timeOnly(new Date().toISOString())} · 每 30 秒更新检测结果`;lastSyncAt=Date.now();
+      if(fromPoll)renderWhenIdle(renderSignature()!==lastRenderSignature);else render();if(notify)toast(Object.keys(accountErrors).length?'面板已刷新，部分账号的 EC2 数据读取失败。':'数据已同步。',Object.keys(accountErrors).length?'info':'success');
     }catch(err){$('#connection-label').textContent='连接需要检查';$('.connection-label .signal-dot').classList.add('error');if(notify)toast(err.message,'error');throw err;}finally{refreshing=false;$('#refresh-icon').classList.remove('rotating');}
   }
   function render(){
@@ -139,8 +150,37 @@
     $('#page-breadcrumb').textContent=nav.find(n=>n[0]===page)?.[2]||'运行概览';
     [['instances',instances.length],['accounts',state.accounts.length],['monitors',state.monitors.length]].forEach(([key,n])=>{const el=$(`#count-${key}`);el.hidden=!n;el.textContent=n;});
     const renderers={overview:renderOverview,instances:renderInstances,accounts:renderAccounts,scripts:renderScripts,monitors:renderMonitors,probes:renderProbes};
-    $('#main-content').innerHTML=(renderers[page]||renderOverview)();
+    const main=$('#main-content'),active=document.activeElement,samePage=main.dataset.page===page;
+    let restore=null;
+    if(samePage&&active&&active!==main&&main.contains(active)){
+      if(active.id)restore={selector:`#${CSS.escape(active.id)}`};
+      else if(active.dataset.action)restore={selector:`[data-action="${CSS.escape(active.dataset.action)}"]`+(active.dataset.id?`[data-id="${CSS.escape(active.dataset.id)}"]`:'')};
+      if(restore&&typeof active.selectionStart==='number')Object.assign(restore,{start:active.selectionStart,end:active.selectionEnd});
+    }
+    const scrolls=samePage?$$('.table-scroll',main).map(el=>el.scrollLeft):[];
+    clearTimeout(deferredRender);deferredRender=null;
+    main.innerHTML=(renderers[page]||renderOverview)();main.dataset.page=page;
+    lastRenderSignature=renderSignature();lastRenderAt=Date.now();
+    $$('.table-scroll',main).forEach((el,index)=>{if(scrolls[index])el.scrollLeft=scrolls[index];});
+    const target=restore&&$(restore.selector,main);
+    if(target){target.focus({preventScroll:true});if(restore.start!=null)try{target.setSelectionRange(restore.start,restore.end);}catch{}}
     if(demo)$('#last-sync').textContent='示例数据 · 只读预览';
+  }
+  function renderSignature(){return JSON.stringify([state,{...state.meta,server_time:null},instances,accountErrors]);}
+  // The user is typing, composing, choosing or selecting text in the page.
+  function userBusy(){
+    const main=$('#main-content'),active=document.activeElement,selection=getSelection();
+    if(composing)return true;
+    if(selection&&!selection.isCollapsed&&main.contains(selection.anchorNode))return true;
+    return !!(active&&main.contains(active)&&active.matches('select,textarea,input:not(#instance-search)'));
+  }
+  // Poll renders: skip when nothing changed (refresh relative times at most once a
+  // minute) and wait while the user is interacting or a dialog is open.
+  function renderWhenIdle(changed){
+    if(!changed&&Date.now()-lastRenderAt<60000)return;
+    clearTimeout(deferredRender);
+    if(modal.open||userBusy()){deferredRender=setTimeout(()=>renderWhenIdle(true),1000);return;}
+    render();
   }
   function navigate(next){if(!nav.some(n=>n[0]===next))return;page=next;searchFilter='';accountFilter='';$('#sidebar').classList.remove('open');history.replaceState(null,'',`${location.pathname}${location.search}#${next}`);render();$('#main-content').focus({preventScroll:true});window.scrollTo({top:0,behavior:'instant'});}
   const heading=(title,description,actions='')=>`<div class="page-heading"><div><h1>${title}</h1><p>${description}</p></div><div class="heading-actions">${actions}</div></div>`;
@@ -161,7 +201,12 @@
   function latestResults(){const seen=new Set();return state.results.filter(r=>{if(seen.has(r.monitor_id))return false;seen.add(r.monitor_id);return true;});}
   function healthPanel(latest,percent){const latencies=latest.filter(r=>Number.isFinite(Number(r.latency_ms))&&r.latency_ms!==null).map(r=>Number(r.latency_ms));const avg=latencies.length?Math.round(latencies.reduce((a,b)=>a+b,0)/latencies.length):null;const gfwReady=state.probes.some(p=>p.enabled!==false&&p.region_type==='mainland')&&state.probes.some(p=>p.enabled!==false&&p.region_type==='overseas');return `<aside class="panel health-panel"><div class="panel-head"><h2>网络健康</h2>${icon('pulse')}</div><div class="health-visual"><div class="health-ring"><svg viewBox="0 0 132 132" aria-hidden="true"><circle class="ring-track" cx="66" cy="66" r="54"/><circle class="ring-fill" cx="66" cy="66" r="54" style="stroke-dashoffset:${339.3*(1-(percent||0)/100)}"/></svg><div class="ring-number">${percent===null?'—':percent+'<span>%</span>'}<small>TCP 连通率</small></div></div><div class="health-caption">${latest.length?`${latest.filter(r=>r.status==='reachable').length} / ${latest.length} 项任务最近检测可连接`:'暂无检测数据'}</div></div><div class="health-metrics"><div><strong>${avg??'—'}<span>ms</span></strong><small>平均 TCP 耗时</small></div><div><strong>${state.probes.length}<span>个</span></strong><small>远程探针</small></div></div><div class="health-note"><strong>${icon('info')}${gfwReady?'双探针已配置':'GFW 判断：证据不足'}</strong>${gfwReady?'对比两地检测结果提供线索，无法单凭 TCP 检测确定封锁。':'当前仅本机 TCP 检测。接入国内、境外探针后可对比路径结果。'}</div></aside>`;}
   function instanceTable(items,compact=false){return `<div class="table-scroll"><table><thead><tr><th>实例 / 名称</th><th>状态</th><th>公网 IPv4</th>${compact?'':'<th>账号 / 区域</th><th>规格</th>'}<th aria-label="操作"></th></tr></thead><tbody>${items.map(i=>`<tr><td><div class="resource-name"><span class="resource-icon">${icon('server')}</span><span>${e(nameOf(i))}<small class="mono">${e(i.id)}${i.stale?' · 缓存':''}</small></span></div></td><td>${badge(i.state)}</td><td><span class="mono">${e(i.public_ip||'—')}</span><div class="cell-sub">${compact?e(i.instance_type):e(publicIpLabel(i))}</div></td>${compact?'':`<td>${e(i.account_name)}<div class="cell-sub">${e(i.availability_zone||i.region)}</div></td><td class="mono">${e(i.instance_type)}</td>`}<td><button class="icon-button" data-action="instance-menu" data-account="${e(i.account_id)}" data-id="${e(i.id)}" aria-label="管理 ${e(nameOf(i))}" title="管理实例">${icon('dots')}</button></td></tr>`).join('')}</tbody></table></div>`;}
-  function renderInstances(){const items=instances.filter(i=>(!accountFilter||i.account_id===accountFilter)&&`${i.name} ${i.id} ${i.public_ip}`.toLowerCase().includes(searchFilter.toLowerCase()));return heading('EC2 实例','查看实例、管理电源与公网 IP，直接操作 AWS 资源。',button('refresh','同步实例','refresh','secondary')+button('launch','创建实例','plus','primary'))+accountErrorHtml()+`<div class="toolbar"><div class="search">${icon('search')}<input id="instance-search" type="search" placeholder="搜索实例名称、ID 或 IP" value="${e(searchFilter)}" aria-label="搜索实例"></div><select id="account-filter" aria-label="按账号筛选">${accountOptions(accountFilter,true)}</select><div class="toolbar-spacer"></div><span class="micro">${items.length} 台实例 · ${items.filter(i=>i.state==='running').length} 台运行中</span></div><section class="panel">${items.length?instanceTable(items):empty('server',instances.length?'没有匹配的实例':'还没有 EC2 实例',instances.length?'尝试其他名称、实例 ID 或账号。':'连接账号后同步当前区域的实例，或直接创建一台新实例。',state.accounts.length?'launch':'add-account',state.accounts.length?'创建实例':'连接 AWS 账号')}</section><div class="notice section-space">${icon('info')}<div>本面板每个账号条目绑定一个区域。查看其他区域，可使用相同凭证新增一个账号条目。停止实例不会删除磁盘；EBS、弹性 IP 等资源仍可能计费。</div></div>`;}
+  function filteredInstances(){const query=searchFilter.toLowerCase();return instances.filter(i=>(!accountFilter||i.account_id===accountFilter)&&[i.name,i.id,i.public_ip].filter(Boolean).join(' ').toLowerCase().includes(query));}
+  function instanceCount(items){return `${items.length} 台实例 · ${items.filter(i=>i.state==='running').length} 台运行中`;}
+  // Update only the result list so the search box keeps focus and IME state.
+  function updateInstanceResults(){const count=$('#instance-count'),results=$('#instance-results');if(page!=='instances'||!count||!results){render();return;}const items=filteredInstances();count.textContent=instanceCount(items);results.innerHTML=instanceResults(items);lastRenderSignature=renderSignature();}
+  function instanceResults(items){return items.length?instanceTable(items):empty('server',instances.length?'没有匹配的实例':'还没有 EC2 实例',instances.length?'尝试其他名称、实例 ID 或账号。':'连接账号后同步当前区域的实例，或直接创建一台新实例。',state.accounts.length?'launch':'add-account',state.accounts.length?'创建实例':'连接 AWS 账号');}
+  function renderInstances(){const items=filteredInstances();return heading('EC2 实例','查看实例、管理电源与公网 IP，直接操作 AWS 资源。',button('refresh','同步实例','refresh','secondary')+button('launch','创建实例','plus','primary'))+accountErrorHtml()+`<div class="toolbar"><div class="search">${icon('search')}<input id="instance-search" type="search" placeholder="搜索实例名称、ID 或 IP" value="${e(searchFilter)}" aria-label="搜索实例"></div><select id="account-filter" aria-label="按账号筛选">${accountOptions(accountFilter,true)}</select><div class="toolbar-spacer"></div><span class="micro" id="instance-count">${instanceCount(items)}</span></div><section class="panel" id="instance-results">${instanceResults(items)}</section><div class="notice section-space">${icon('info')}<div>本面板每个账号条目绑定一个区域。查看其他区域，可使用相同凭证新增一个账号条目。停止实例不会删除磁盘；EBS、弹性 IP 等资源仍可能计费。</div></div>`;}
   function renderAccounts(){return heading('AWS 账号','凭证只保存在你的后端，使用 STS 验证身份。',button('add-account','添加账号','plus','primary'))+`<div class="notice">${icon('shield')}<div><strong>兼容受限的免费项目。</strong> 验证账号不调用 account:GetContactInformation，也不会自动升级计划。AWS 权限仍受 IAM 和组织 SCP 共同限制。</div></div>`+(state.accounts.length?`<section class="cards-grid">${state.accounts.map(a=>`<article class="account-card"><div class="card-title"><span class="account-icon">${icon('cloud')}</span><div><h2>${e(a.name)}</h2><p>AWS ACCOUNT</p></div><button class="icon-button danger" data-action="delete-account" data-id="${e(a.id)}" aria-label="移除账号 ${e(a.name)}">${icon('trash')}</button></div><dl class="detail-list"><div><dt>账户 ID</dt><dd class="mono">${e(a.aws_account_id)}</dd></div><div><dt>默认区域</dt><dd>${e(a.region)}</dd></div><div><dt>Access Key</dt><dd class="mono">${e(a.access_key_hint||'已加密保存')}</dd></div><div><dt>实例数量</dt><dd>${instances.filter(i=>i.account_id===a.id).length} 台</dd></div></dl><div class="card-foot">${badge(accountErrors[a.id]?'error':'reachable',accountErrors[a.id]?'同步失败':'已连接')}${button('view-account','管理实例 '+icon('arrow'),'','link-button',`data-id="${e(a.id)}"`)}</div></article>`).join('')}</section>`:`<section class="panel">${empty('accounts','连接你的第一个 AWS 账号','添加 Access Key 和 Secret Access Key，将当前区域的 EC2 资源带入你的工作台。无需 AWS 登录密码。','add-account','添加 AWS 账号')}</section>`);}
   function renderScripts(){return heading('开机脚本','保存常用 User Data，在创建实例时一键复用。',button('add-script','新建脚本','plus','primary'))+`<div class="notice">${icon('code')}<div><strong>Linux 脚本请以 #!/bin/bash 或 #cloud-config 开头。</strong> User Data 通常只在实例首次启动时执行。修改已有实例的脚本不保证下次开机重新执行；不要在脚本中保存长期密钥。</div></div>`+(state.scripts.length?`<section class="cards-grid">${state.scripts.map(s=>`<article class="script-card"><div class="card-title"><span class="resource-icon">${icon('terminal')}</span><div><h2>${e(s.name)}</h2><p>${e(String(s.content||'').split('\n').length)} 行 · User Data</p></div><button class="icon-button" data-action="edit-script" data-id="${e(s.id)}" aria-label="编辑脚本 ${e(s.name)}">${icon('edit')}</button></div><pre class="script-preview">${e(s.content)}</pre><div class="card-foot"><small>创建于 ${e(shortDate(s.created_at))}</small><div class="stacked-buttons">${button('edit-script','编辑',null,'compact secondary',`data-id="${e(s.id)}"`)}<button class="icon-button danger" data-action="delete-script" data-id="${e(s.id)}" aria-label="删除脚本 ${e(s.name)}">${icon('trash')}</button></div></div></article>`).join('')}</section>`:`<section class="panel">${empty('terminal','将重复配置，变成一份脚本','把软件安装、环境初始化等步骤保存下来，在创建 EC2 时选择使用。','add-script','新建开机脚本')}</section>`);}
   function eipCleanupNotice(){
@@ -331,8 +376,11 @@
     const handlers={navigate:()=>navigate(el.dataset.page),'toggle-sidebar':()=>$('#sidebar').classList.toggle('open'),refresh:()=>refreshData(true).catch(()=>{}),reload:()=>location.reload(),'close-modal':closeModal,'add-account':addAccount,'view-account':()=>{navigate('instances');accountFilter=id;render();},launch:launchInstance,'add-script':()=>addScript(),'edit-script':()=>addScript(id),'delete-script':()=>confirmDelete('script',id),'delete-account':()=>confirmDelete('account',id),'instance-menu':()=>instanceMenu(accountId,id),'start-instance':()=>confirmInstanceAction('start',accountId,id),'stop-instance':()=>confirmInstanceAction('stop',accountId,id),'reboot-instance':()=>confirmInstanceAction('reboot',accountId,id),'user-data':()=>updateUserData(accountId,id),'rotate-ip':()=>rotateIP(accountId,id),'add-monitor':()=>addMonitor(),'edit-monitor':()=>addMonitor(id),'delete-monitor':()=>confirmDelete('monitor',id),'toggle-monitor':()=>toggleMonitor(id,el),'reset-rotation':()=>resetRotation(id),'run-monitor':()=>runMonitor(id,el),'monitor-tab':()=>{monitorTab=el.dataset.tab;render();},'result-details':()=>showResult(id),'add-probe':addProbe,'delete-probe':()=>confirmDelete('probe',id),'keep-eip':()=>updateEipCleanup(id,false),'approve-eip-cleanup':()=>updateEipCleanup(id,true),logout:async()=>{if(demo){location.href='/';return;}try{await post('/logout');authenticated=false;clearInterval(pollTimer);state={accounts:[],scripts:[],monitors:[],results:[],activity:[],probes:[],eip_cleanup:[],meta:{default_region:'us-east-1'}};instances=[];showAuth(false);}catch(err){toast(err.message,'error');}}};
     if(handlers[action])await handlers[action]();
   });
-  document.addEventListener('change',event=>{if(event.target.id==='account-filter'){accountFilter=event.target.value;render();}});
-  document.addEventListener('input',event=>{if(event.target.id==='instance-search'){const position=event.target.selectionStart;searchFilter=event.target.value;render();const input=$('#instance-search');input.focus();try{input.setSelectionRange(position,position);}catch{}}});
+  document.addEventListener('change',event=>{if(event.target.id==='account-filter'){accountFilter=event.target.value;updateInstanceResults();}});
+  document.addEventListener('compositionstart',event=>{if(event.target.id==='instance-search')composing=true;});
+  document.addEventListener('compositionend',event=>{if(event.target.id==='instance-search'){composing=false;searchFilter=event.target.value;clearTimeout(searchTimer);updateInstanceResults();}});
+  document.addEventListener('input',event=>{if(event.target.id!=='instance-search'||event.isComposing||composing)return;searchFilter=event.target.value;clearTimeout(searchTimer);searchTimer=setTimeout(updateInstanceResults,150);});
+  document.addEventListener('visibilitychange',()=>{if(!document.hidden&&authenticated&&!demo&&Date.now()-lastSyncAt>30000&&!modal.open)refreshData(false,false,true).catch(()=>{});});
   document.addEventListener('click',event=>{if($('#sidebar').classList.contains('open')&&!event.target.closest('#sidebar')&&!event.target.closest('[data-action="toggle-sidebar"]'))$('#sidebar').classList.remove('open');});
   modal.addEventListener('cancel',event=>{if(modalBusy)event.preventDefault();});
   modal.addEventListener('close',()=>{if(!modalBusy)$('#modal-content').innerHTML='';});
