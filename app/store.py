@@ -242,6 +242,11 @@ class Store:
             row = db.execute("SELECT data FROM rotation_guards WHERE resource_key=?", (key,)).fetchone()
         return json.loads(row[0]) if row else {}
 
+    def rotation_guards(self):
+        with self.connect() as db:
+            rows = db.execute("SELECT resource_key,data FROM rotation_guards").fetchall()
+        return {row[0]: json.loads(row[1]) for row in rows}
+
     def reserve_rotation(self, key, monitor_id, revision, timestamp, *, monitor_token, resource_token):
         """Commit an attempt + uncertainty marker BEFORE a non-idempotent AWS call."""
         with self.connect() as db:
